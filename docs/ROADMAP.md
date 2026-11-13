@@ -3,6 +3,10 @@
 > 本文给出从「当前状态」到「工程化、可复现、可发表」的几个明确方向，按优先级与投入分层。
 > 其中 **P0** 为阻断性问题，必须先解决才能继续。
 
+> **📌 2026-11-13 更新**：A1（接入 v3）已落地，主实验默认基线已改为每用例复位 WFD。
+> 当前数字与验收见 [`validation/2026-11-13/SUMMARY.md`](validation/2026-11-13/SUMMARY.md)；
+> 本文其余内容保留为规划记录。
+>
 > 📌 **三份文档的分工**
 > - [`PROJECT_AUDIT.md`](PROJECT_AUDIT.md) —— **现状与问题清单**（B/D/K/S/R 编号，可复现命令与数字）；
 > - `ROADMAP.md`（本文）—— **任务级拆解**：A1…D、P0…P3、预估投入、验收标准；
@@ -71,11 +75,11 @@
 ### A3. 将调度器产出一份「纯补丁」（P1）✅ 已完成
 当前改动**散落在 8+ 个标准内核文件**中，难以评审与回溯 —— 已解决：
 
-- ✅ 产出 [`patches/`](../patches)：**6 个补丁 / 188 KB**，覆盖全部 Yat 改动
+- ✅ 产出 [`patches/`](../patches)：**7 个补丁 / 274 KB**，覆盖全部 Yat 改动
   - `0001-sched-yat-casched-core.patch` —— 调度类主体
   - `0002-sched-yat-casched-integration.patch` —— 8 处标准内核集成点
   - `0003-x86-realmode-tolerate-missing-trampoline.patch` —— 编译兼容
-  - `0004-kernel-gitignore.patch` / `0005-test-env.patch` / `0006-docs.patch`
+  - `0004-kernel-gitignore.patch` / `0005-test-env.patch` / `0006-docs.patch` / `0007-...-fix-lockdep-inversion.patch`
   - [`series`](../patches/series)（`git quiltimport` 可直接消费）+
     [`MANIFEST.sha256`](../patches/MANIFEST.sha256)
 - ✅ [`scripts/gen_kernel_patches.sh`](../scripts/gen_kernel_patches.sh) 生成并**断言往返一致**

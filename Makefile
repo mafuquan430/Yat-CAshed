@@ -11,7 +11,7 @@ REPORT_DIR := report/paper
 
 .DEFAULT_GOAL := help
 
-.PHONY: help check docs-check name-check verify-all simulator simulator-compile simulator-quick simulator-verify simulator-test symbol-check visualize report clean tree homepage patch-check patch-apply patch-reverse patch-status patch-selftest kernel-setup kernel-obj kernel-build kernel-bench kernel-compare
+.PHONY: help check docs-check numbers-check name-check verify-all simulator simulator-compile simulator-quick simulator-verify simulator-test symbol-check visualize report clean tree homepage patch-check patch-apply patch-reverse patch-status patch-selftest kernel-setup kernel-obj kernel-build kernel-bench kernel-compare
 
 help:
 	@echo "=========================================="
@@ -19,6 +19,7 @@ help:
 	@echo "=========================================="
 	@echo "  make check             仓库健康检查（冲突标记/空文件/结构）"
 	@echo "  make docs-check        Markdown 相对链接检查（失效链接即失败）"
+	@echo "  make numbers-check     论文/README 数字与归档数据一致性（不一致即失败）"
 	@echo "  make name-check        项目名拼写一致性检查（规范名 Yat-CAShed）"
 	@echo "  make symbol-check      内核头文件/实现符号一致性检查（静态）"
 	@echo "  make verify-all        check + docs-check + name-check + symbol-check + 补丁自检 + 模拟器全套验证"
@@ -58,6 +59,9 @@ check:
 docs-check:
 	@python3 scripts/check_docs.py
 
+numbers-check:
+	@python3 scripts/check_numbers.py
+
 # 项目名拼写一致性：规范名 Yat-CAShed；豁免 docs/archive（历史快照）、
 # report（论文交付物）、patches（生成物）与二进制。
 name-check:
@@ -68,7 +72,7 @@ symbol-check:
 	@bash scripts/check_symbols.sh
 
 # 一键全量门禁（CI 等价的最小集合）
-verify-all: check docs-check name-check symbol-check patch-check simulator-verify
+verify-all: check docs-check numbers-check name-check symbol-check patch-check simulator-verify
 	@echo ">>> 全部门禁通过"
 
 # ---- 内核补丁包（替代 1.6GB 内核整树入库）----

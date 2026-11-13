@@ -89,6 +89,11 @@ graph TD
 | 选取 | `pick_calls/pick_null_desync` | `pick_null_desync > 0` 即「核心层说有任务、本类说没有」的计数失步 |
 | 接管率 | `place_hit/place_miss/place_pending` | **AJLR 决策最终有没有被执行**（累计值） |
 
+其中 `ttwu_*` 四个字段由 [`yat_probe_ttwu()`](../linux-6.8-main/kernel/sched/yat_casched.c)
+在 core.c 的 `try_to_wake_up()` 四个出口处调用累加，**只统计目标是 yat 类的唤醒**——
+否则 guest 里 init / busybox 等 CFS 任务的唤醒会把计数冲到几十万，yat 的那几次被淹没。
+`place_*` 则在 `pick_next_task` 选中任务时累加，因此不受「作业随任务退出而释放」影响。
+
 读法要点：
 
 - `select_calls == 0` 且 `enq_calls > 0`：任务确实进了 yat 类，但**唤醒没走到选核**
@@ -132,6 +137,20 @@ yat_casched:yat_casched_enqueue / _dequeue / _pick / _place / _wakeup_place / _a
 两轮为**两个独立 QEMU 进程**，唯一变量是调度策略。
 Makefile 侧由 `kernel-compare` 目标驱动。
 
+`yat_bench` 的关键参数（A8 之后新增的后三个决定「能不能测到 AJLR」）：
+
+| 参数 | 作用 | 注意 |
+|------|------|------|
+| `--tasks/--iters/--cpu` | 负载规模与 `shared` 模式下的目标核 | — |
+| `--affinity shared\\|none\\|spread` | 亲和性模式 | `shared` 使 `nr_cpus_allowed == 1` → `select_task_rq` 包装层直接返回，**不调用调度类** |
+| `--sleep-us U` | 每段计算后 `nanosleep`（固定切 64 段） | `0` 时只有 `WF_FORK`，本类在非 `WF_TTWU` 早退 |
+| `--verbose` | 逐阶段打印 `YTASK` 标记 | 仅排障用；正常测量会污染 `vol_ctx` |
+
+因此**验证 A8 的负载必须同时满足 `--affinity none` 与 `--sleep-us > 0`**；
+脚本会自动判定并在结尾打印 ⚠️ / ✅。CSV 为 13 列，末尾两列 `affinity,sleep_us`
+是自描述字段（追加，不打乱旧列），列定义见 [`SCHEMA.md`](SCHEMA.md) §2.1。
+完整操作步骤见 [`OPERATIONS.md`](OPERATIONS.md)。
+
 ### 3.2 调度类关键回调（`DEFINE_SCHED_CLASS`）
 
 `.enqueue_task .dequeue_task .yield_task .yield_to_task .wakeup_preempt .pick_next_task
@@ -159,6 +178,20 @@ pick_next_task
 
 task_dead  → yat_destroy_job(job)：作业生命周期与 task_struct 对齐，精确释放一次
 ```
+
+**这条链路成立的前提（A8.1 实跑踩出来的四个坑）**：上面每一步都依赖「任务确实在
+yat 类里、且 `rq->nr_running` 与类内计数同步」。任一条不成立，链路会安静地断在中间：
+
+| 前提 | 破坏后的表现 | 修复位置 |
+|------|--------------|----------|
+| yat 策略的 `p->prio` 不能落进实时区间 | 任务被挂到 `rt_sched_class`，类内空无一人 | `__normal_prio()`（core.c） |
+| `__setscheduler_prio()` 必须按策略判定 | 同上，分支被 `rt_prio()` 抢先 | 同上 |
+| `sched_fork()` 必须识别 yat 策略 | 子任务降级为 CFS | core.c `sched_fork` |
+| enqueue/dequeue 必须调用 `add_nr_running()/sub_nr_running()` | `rq->nr_running` 恒 0 → `__pick_next_task()` 连 yat 类都不遍历 → CPU 进 idle、任务永不运行（静默挂死） | `enqueue/dequeue_task_yat_casched()` |
+
+因此排障时的第一问题永远是：**`enq_calls` 有没有涨？`ttwu_ok` 有没有涨？**
+两者都涨而 `select_calls` 不涨，才是选核逻辑本身的问题。详见
+[ROADMAP.md](ROADMAP.md) §A8.1 与 [`OPERATIONS.md`](OPERATIONS.md) 的「计数器读法」。
 
 **为什么不在 `balance()` 里迁移**：`class->balance()` 由 `put_prev_task_balance()`
 在持有本核 `rq_lock` 时调用；跨核 `set_task_cpu()` 需要目标核 `rq_lock`，

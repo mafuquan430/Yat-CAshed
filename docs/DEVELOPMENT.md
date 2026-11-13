@@ -94,7 +94,7 @@ cd simulator
 make help                # 查看全部目标
 make compile             # 编译
 make lib-test            # 依赖库自检
-make test                # 单元测试（tests/YatSimulatorTest.java，102 断言）
+make test                # 单元测试（tests/YatSimulatorTest.java，116 断言）
 make run-quick           # 轻量实验
 make run                 # 全量实验（100 用例）+ 可视化 + 3 张 300dpi 图表
 make picture             # 单独生成图表
@@ -104,7 +104,22 @@ build.bat run
 ```
 
 可调参数（详见 `make help` 与 [`README.md`](../README.md)）：
-`--cores=`、`--cases=`、`--tasks=`、`--seed=`、`--no-viz`。
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `--cores=` `--cases=` `--tasks=` | 8 / 100 / 60 | 规模 |
+| `--seed=` `--seeds=` | 42 | 单种子 / 多种子（`--seeds=5` 表示 1..5） |
+| `--no-viz` | 关闭 | 跳过 Python 出图 |
+| `--legacy-metrics` | 关闭 | 旧的不公平度量口径，仅用于复现历史数字 |
+| `--allocator=v2\|v3` | v2 | 挑战者；v3 = AJLR-lite |
+| `--policy=NAME` | HEAD_ROOM | v3 判定规则（或 MIN_FINISH） |
+| `--alpha=R` | 0.5 | v3 负载窗口 |
+| `--premium=R` | 1.0 | v3 的 CRP 溢价缩放 |
+| `--legacy-wfd-state` | 关闭 | WFD 负载跨用例不清零的旧基线口径（复现归档用） |
+
+> 默认基线是"每个用例前复位 WFD"。`--legacy-wfd-state` 与 `--legacy-metrics` 都只为复现
+> 历史数字而保留；当前结论见
+> [`validation/2026-11-13/SUMMARY.md`](validation/2026-11-13/SUMMARY.md)。
 
 > 环境依赖：仅需 JDK 17+（`sudo apt install -y openjdk-17-jdk-headless`）。
 > Maven/Gradle 非必需，第三方 JAR 已内置于 `simulator/lib/`。

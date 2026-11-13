@@ -77,3 +77,16 @@
 4. **链接门禁**：`make docs-check` 会校验本索引及全仓库 Markdown 的相对链接，
    CI 已接入；新增/移动文档后请本地先跑一次。
 5. **归档**：被取代的文档移入 `docs/archive/` 并在其 README 登记，不直接删除。
+
+- [2026-10-24 修补与论文证据审计](REPAIR_REVIEW_2026-10-24.md)：本轮修复、测试结果及待验收事项。
+
+- [完善任务验收](COMPLETION_TASKS.md)
+- [五种子复核结果](validation/2026-10-24/SUMMARY.md)
+
+- [实验导出可靠性验收](EXPORT_RELIABILITY_2026-10-28.md)
+
+- [实验统计边界修复](STATISTICS_REVIEW_2026-10-29.md)
+
+- [多种子输入完整性](SEED_VALIDATION_2026-10-29.md)
+
+- [配置优先级修补与后续任务](CONFIG_PRECEDENCE_2026-10-30.md)

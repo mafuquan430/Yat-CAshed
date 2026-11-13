@@ -102,66 +102,59 @@ Yat-CAShed/
 > 架构与集成点说明见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)，迭代记录见 [`yat_casched优化记录.md`](linux-6.8-main/yat_casched优化记录.md)，
 > 初赛版/决赛版的**历史**实现文档已归档到 [`docs/archive/`](docs/archive)。
 
-### 2. 调度模拟器（[`simulator/`](simulator)）
+### 2. 内核实测（QEMU，默认证据链）
 
-基于 Java 的高性能调度算法模拟器，支持：
+在 QEMU（4 vCPU，TCG）上用同一份负载跑三组对照，每组重复 5 次，报墙钟比值
+`yat/cfs` 的中位数与全距（原始 CSV 与串口日志见
+[`docs/validation/2026-11-13/kernel/repeat/`](docs/validation/2026-11-13/kernel/repeat/)）：
 
-- 多算法对比：WFD（Worst Fit Decreasing）与 CacheAware（v1/v2）
-- 多级缓存建模（L1/L2/L3）与缓存敏感度分析
-- 可复现实验（固定随机种子）与批量验证
-- 可视化结果（Makespan、缓存命中率、执行时间对比）
+| 配置 | 中位数 | 全距 | 回答的问题 |
+|------|--------|------|-----------|
+| `none` + 200 µs（主口径） | **2.00×** | [1.61, 2.51] | 完整链路的代价 |
+| `shared` + 200 µs（回调不被调用） | **1.70×** | [1.55, 2.40] | 只有"接入调度类"的代价 |
+| `none` + 无唤醒 | **1.10×** | [0.73, 1.36] | 唤醒路径的代价 |
 
-编译与运行（跨平台 GNU Make，Windows 亦可用 `build.bat`）：
+**决策链路是通的**：主口径下 512 次唤醒触发 487 次选核（其余走 wakelist 快路径），
+其中 216 次由"目标核空闲"直接复用，271 次完整决策全部落地，接管率
+`996/1017 = 97.9%`，平均可运行核数 4.0，`pick_null_desync = 0`。
+
+**代价的归属**：pin 到单核（`select_calls = 0`，AJLR 一次都不跑）仍慢 1.70×，
+说明主体代价来自“唤醒时进入这个调度类”，选核只占边际（2.00/1.70 ≈ 1.18）；
+没有唤醒时两者没有可分辨差异（1.10，全距 [0.73, 1.36] 跨 1）；
+`balance_runs = 757` 而唤醒只有 512 次，说明几乎每个调度点都在重扫就绪池。
 
 ```bash
-# Windows
-.\build.bat run            # 编译 + 实验 + 可视化
-
-# Linux / macOS
-make -C simulator test      # 单元测试（102 断言，零依赖）
-make -C simulator verify    # 编译 + 依赖库自检 + 单元测试 + 快速实验
-make -C simulator run-quick # 轻量可复现回放（5 用例 / 20 任务 / 种子 42）
-make -C simulator run       # 全量实验（100 用例）+ 可视化
-make -C simulator picture   # 单独生成可视化图表（需 Python + matplotlib）
+# 重跑全部 15 次测量（3 配置 × 5 次，约 30 分钟）
+bash scripts/run_kernel_repeats.sh --repeats 5
 ```
 
-可调参数（`AlgorithmComparisonExperiment`）：
+> ⚠️ 所有实测都在 QEMU/TCG 上，墙钟与真实机器不可比，同配置三次可差 28%。
+> 因此只报中位数与全距、不报 p 值，也不把 5% 量级的差异当结论。
 
-| 参数 | 默认 | 说明 |
-|------|------|------|
-| `--cores=N` | 8 | 模拟核心数 |
-| `--cases=N` | 100 | 实验用例总数（按利用率等级均匀分布） |
-| `--tasks=N` | 60 | 每用例任务数 |
-| `--seed=N` | 42 | 随机种子（保证可复现） |
-| `--no-viz` | 关闭 | 跳过可视化，仅输出数值与 CSV |
+### 3. 前期工作：调度模拟器（[`simulator/`](simulator)）
 
-### 可复现实验结果
+项目早期用 Java 17 写过一个调度模拟器（6361 行，含 CSV 导出、t 区间统计与 116 项单测），
+用于在不依赖内核的情况下比较 WFD 与缓存感知启发式。
 
-**快速回放（`run-quick`，5 用例 / 20 任务 / 种子 42）**
+**它已经不在证据链里**：模拟器的执行时间与命中判定都由自建缓存模型给出，不含抢占、
+迁移、TLB 与真实 LLC 竞争；同一批数据在三套口径下分别是 11.66%、−0.95%、−3.52%，
+说明它只能回答"在理想模型下某条规则会怎么表现"。论文正文只留一段交代（第 6.4 节），
+数字与复现已归档在 [`docs/validation/2026-11-13/`](docs/validation/2026-11-13/)。
 
-| 指标 | 结果 |
-|------|------|
-| Makespan 平均改善 | **17.36%** |
-| 缓存命中率平均改善 | **31.81 个百分点** |
-| CacheAware_v2 胜率 | **100%** |
+代码仍然可用，作为设计期校验工具：
 
-**全量实验（`make -C simulator run`，100 用例 / 60 任务 / 种子 42）**
+```bash
+make -C simulator test        # 116 项单测
+make -C simulator verify      # 编译 + 依赖自检 + 单测 + 快速实验
+make -C simulator run-quick   # 5 用例冒烟
+make -C simulator run         # 全量实验（100 用例）+ 可视化
+```
 
-| 指标 | 结果 |
-|------|------|
-| 平均 Makespan 改进 | **11.66%** |
-| 平均缓存命中率改进 | **30.21 个百分点**（73.8% vs 43.6%） |
-| CacheAware_v2 胜率 | **96 / 100 = 96.0%** |
-| 覆盖率 | 利用率 0.6 / 0.8 / 1.0 / 1.2 / 1.5 各 20 例 |
+> 历史口径（`--legacy-metrics`、`--legacy-wfd-state`）保留为开关，只为复现旧数字，
+> 不参与任何结论。模拟器的设计说明见 [`Simulator.md`](simulator/Simulator.md)，
+> 早期实验报告见 [`docs/EXPERIMENT_REPORT.md`](docs/EXPERIMENT_REPORT.md)（顶部有时效声明）。
 
-> 数据由 `make -C simulator run` 生成：CSV 导出至 `simulator/result/algorithm_comparison_results.csv`，
-> 3 张 300 dpi 图表（`makespan_analysis.png`、`cache_hit_analysis.png`、
-> `execution_time_and_win_rate_analysis.png`）一并输出至 `simulator/result/`（该目录已被 `.gitignore` 忽略，属本地复现产物）。
-
-完整说明见 [`Simulator.md`](simulator/Simulator.md)；**实验设计、完整统计与有效性讨论**见
-[`docs/EXPERIMENT_REPORT.md`](docs/EXPERIMENT_REPORT.md)。
-
-### 3. 论文与资料（[`report/`](report)）
+### 4. 论文与资料（[`report/`](report)）
 
 - [`report/paper/`](report/paper)：毕业论文 LaTeX 源码（`Yat-CAShed.tex` 等章节文件）
 - 参考论文：AJLR（RTNS'23）、Cache-Aware Allocation of Parallel Jobs on Multi-cores
@@ -197,14 +190,17 @@ linux-6.8-main/yat_test_scripts/compare_cfs_vs_yat.sh \
 ## 仓库健康检查
 
 ```bash
-make check        # 冲突标记 / 空文件 / 关键文件
-make docs-check   # Markdown 相对链接有效性
-make symbol-check # 内核头文件声明 vs 实现定义
-make verify-all   # 以上 + 模拟器全套验证（CI 等价）
+make check          # 冲突标记 / 空文件 / 关键文件
+make docs-check     # Markdown 相对链接有效性
+make numbers-check  # 论文/README 的数字 vs 归档 CSV 与计数器（53 项比对）
+make symbol-check   # 内核头文件声明 vs 实现定义
+make verify-all     # 以上 + 模拟器全套验证（CI 等价）
 ```
 
 - [`scripts/check_repo.sh`](scripts/check_repo.sh)：冲突标记、空文件、关键文件守卫
 - [`scripts/check_docs.py`](scripts/check_docs.py)：全仓库自维护 Markdown 的相对链接检查
+- [`scripts/check_numbers.py`](scripts/check_numbers.py)：从 `all.csv` 复算中位数/全距与派生百分比，
+  再与论文第 6 章表格、摘要、结论、README 逐项比对——抄错一个数就失败
 - [`scripts/check_symbols.sh`](scripts/check_symbols.sh)：核对 `yat_casched.h` 声明与 `yat_casched.c` 定义
   （当前 29 个声明 / 27 个非 static 定义 / 28 个 static 定义，A/B/C 三类不一致均为 0）
 - 三者均已接入 CI（[`.github/workflows/ci.yml`](.github/workflows/ci.yml)）
@@ -232,3 +228,5 @@ make report      # 优先 latexmk -xelatex，产物 report/paper/Yat-CAShed.pdf
   第三方依赖 `simulator/lib/commons-math3-3.6.1.jar` 归其作者所有（Apache-2.0）。
 - **文档与论文**（`docs/`、`report/` 中本项目撰写部分）：学术研究与教学使用，转载请注明出处。
   `report/` 内引用的第三方论文 PDF 版权归原作者，仅作学习研究。
+
+> 2026-10-24 复核：上文历史收益不能作为当前统一模型结论。五种子500配对用例的 Makespan 改善均值为 -0.954%，95%区间跨零；详见 [复核结果](docs/validation/2026-10-24/SUMMARY.md)。无图模式现已修复为正常导出 CSV。

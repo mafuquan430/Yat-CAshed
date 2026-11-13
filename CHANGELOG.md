@@ -3,6 +3,91 @@
 本项目自本文件引入之日起采用 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 风格记录变更。
 日期格式为 `YYYY-MM-DD`。
 
+## [2026-11-13] 论文改为以内核证据为主；仿真器降级为前期工作
+
+### 变更（Changed，论文）
+
+- 论文重写为**内核优先**：第 6 章从"仿真复核"改为"内核实测"，删掉 6 张表、2 张图与全部
+  仿真数字；第 3 章仿真侧组成压成一段前期工作说明；第 4 章删去"两份实现的差距"与
+  "AJLR-lite"两节（那是仿真侧的改进，内核未实现）；第 7 章把三节仿真口径问题合并成一节；
+  第 8 章结论改为"可用性未达标 + 代价归因"。篇幅 24 页 → 21 页。
+- 摘要、第 1 章交付物表、第 2 章定位段同步。仿真器在正文只剩第 6.4 节一段（做了什么、
+  为什么不算证据、数据在哪）。
+
+### 新增（Added，门禁）
+
+- `scripts/check_numbers.py` + `make numbers-check`：从 `docs/validation/2026-11-13/kernel/repeat/all.csv`
+  独立复算中位数/全距与三个派生百分比，再与论文第 6 章表格、摘要、结论与 README 逐项比对（53 项）。
+  已接入 `make verify-all`。第一次运行就抓到一处缺失（`pick_calls` 写成"见 CSV"），说明门禁有用。
+
+### 新增（Added，实测）
+
+- `scripts/run_kernel_repeats.sh`：3 组配置 × 5 次重复的内核测量脚本，输出中位数/全距与
+  每轮原始 CSV，归档到 `docs/validation/2026-11-13/kernel/repeat/`。
+- 实测结论：主口径 **2.00×**（全距 `[1.61, 2.51]`）、回调不被调用 **1.70×**、
+  无唤醒 **1.10×**（跨 1）。归因：主体代价在"唤醒时进入调度类"的路径，选核只占
+  边际（≈1.18）；早期"无唤醒快 17%"的单次结果不成立。
+
+## [2026-11-13] — 数据复核、论文重写、AJLR-lite 与锁反序修复
+
+### 结论变更（Changed）
+
+- **推翻 11.66% / +30.21 pp / 96% 胜率**：统一模型（`SharedCacheModel` 是唯一执行时间与命中
+  判定来源）下 5 种子 × 100 用例的真实结果为 Makespan **−0.954%**（95% CI `[-2.700, 0.792]`，
+  跨零）、命中率 **+0.377 pp**、胜率 **48.6%**。旧数字来自两套模型口径，`--legacy-metrics`
+  仍可逐位复现，仅作历史对照。README 相应段落已改写。
+- **主实验数字被定位为「基线占便宜」**：`WFD.PROCESSOR_LOADS` 为静态且只在种子开始时复位，
+  用例间残留负载；`--legacy-wfd-state` 打开时 v2 逐种子值与主实验完全一致（−0.954%），
+  关闭后同一算法为 **−3.524%**。
+- 单测断言数 102 → 116。
+
+### 新增（Added）
+
+- `simulator/allocation/CacheAware_v3.java`：AJLR-lite 分配器。维护每核/每 L2 组/全局的
+  「最后执行的 DAG + 访问序号」，在负载窗口 `α` 内做 MSF；支持 `MIN_FINISH` / `HEAD_ROOM`
+  两种判定与 `setPremiumScale()` 误差敏感性。
+- `simulator/AjlrLiteExperiment.java`：三算法（WFD / v2 / v3）配对实验入口，
+  `--legacy-wfd-state` 可复刻旧口径，其余配置每用例复位基线。
+- `scripts/run_ajlr_lite_matrix.sh` + `scripts/analyze_ajlr_lite.py`：8 个配置 × 5 种子的
+  可复现矩阵与汇总（含出图）。
+- `docs/validation/2026-11-13/`：本轮全部 CSV、日志与 `SUMMARY.md`。
+
+### 修复（Fixed）
+
+- **锁反序（lockdep 实证）**：`task_dead_yat_casched()` 在开中断上下文获取 `pool->lock`，
+  与 balance 路径「持 `rq_lock` 且关中断」的获取顺序构成环。改为 `local_irq_save()` 包裹
+  `yat_destroy_job()`；镜像 #19 复跑两组对照，同类告警 0 次。
+- 论文各章节与 `README.md` 的性能数字、断言数、镜像号同步更新。
+
+### 接入（路线 A 落地）
+
+- `AlgorithmComparisonExperiment` 新增 `--allocator=v2|v3`、`--policy=`、`--alpha=`、`--premium=`、
+  `--legacy-wfd-state`；挑战者名字进 `Algorithm` 列，CSV schema 不变。
+- **主实验默认口径改为每用例复位 WFD**。旧口径（静态负载跨用例累积）由 `--legacy-wfd-state`
+  保留，5/5 逐字节复现 `2026-10-24` 归档。
+- 结果：默认口径下 v2 = **−3.524%**（区间 `[-5.277, -1.771]`）、v3(α=0.5) = **+0.988%**
+  （`[0.517, 1.459]`）、命中率 **+6.788 pp**、胜率 **58.4%**；v3 与 `AjlrLiteExperiment`
+  独立复现一致到小数点后三位。旧口径下同一批用例是 −0.954% / +3.385%，偏差把整张表抬高约 2.5 pp。
+
+### 修复（Fixed，内核补丁集）
+
+- 新增 `patches/0007-sched-yat-casched-fix-lockdep-inversion.patch`：把 `task_dead_yat_casched()`
+  的销毁动作放进 `local_irq_save()` 区间。此前补丁集只到 0006，用它重建内核拿不到论文 §6.7
+  声称的锁修复——现在补丁集与 `linux-6.8-main/` 一致。已用「修复前文件 + 补丁 == 当前文件」
+  做往返验证；`series` 与 `MANIFEST.sha256` 同步刷新，`make patch-check` 7/7 通过。
+
+### 修复（Fixed，统计）
+
+- `scripts/analyze_ajlr_lite.py` 的 t 分位数按样本量查表（n=5 用了 2.571），区间窄 7.4%；
+  改为按自由度 `T[n-1]`。均值不变，"是否跨零"的结论不变。
+
+### 实测要点（见 docs/validation/2026-11-13/SUMMARY.md）
+
+- `CacheAware_v3`（α=0.5）：Makespan **+0.988%**（CI `[0.551, 1.425]`）、命中率 **+6.79 pp**、
+  响应时间改善 3.4%；α=2.0 时命中率 +27.67 pp 但 Makespan 转负。
+- 内核：AJLR 接管率 **98.5%**（`place_hit` 981/996），但墙钟为 CFS 的 1.78–2.28 倍；
+  单核 pin（回调未被调用）仍慢 1.75–1.99 倍，无唤醒时反而快 17% ⇒ 代价在唤醒路径回调，
+  不在选核。
 ## [Unreleased] — 文档治理与测试入口整理（无内核行为变更）
 
 本轮只做「检查、整理、可读性」，不改调度算法。
@@ -38,6 +123,14 @@
   `compare_cfs_vs_yat.sh` 三条命令，并给出实测基线与限定说明；
   符号统计更正为实测的 29 声明 / 27 非 static 定义 / 28 static 定义。
 
+### 移除（Removed）
+
+- 删除 `linux-6.8-main/initramfs/init` 与 `initramfs_fixed/init`：不被任何脚本引用，
+  `CONFIG_INITRAMFS_SOURCE` 也留空，属于早期手工环境的遗留副本。
+- 停止跟踪 `linux-6.8-main/yat_simple_test_env/initramfs/init`：`build_yat_simple_test.sh`
+  会先 `rm -rf` 整个目录再用 heredoc 重写 `init`，跟踪它等于让脚本删掉受版本控制的文件；
+  改为整目录 `.gitignore`。`patches/0005` 相应由 23 hunk 降为 20 hunk。
+
 ### 文档更正（Docs）
 
 - ROADMAP 总览表把 A8 由「实测待跑」改为「已完成（接管率 98%）」；
@@ -48,6 +141,14 @@
   遗留的 `test_visualization/performance_results.csv` 降级为历史资料并标注不可用。
 - ARCHITECTURE §5.1 关闭「接管率尚未实测」，写入 512/254/254/925·0·14 与 98%，
   同时保留「墙钟差异 ≠ AJLR 收益」的限定。
+- `boot_test_scripts/README.md` 补齐 `yat_bench` 的完整参数表（`--affinity`
+  三种模式的语义与能否测到 AJLR、`--sleep-us`、`--verbose`）、13 列 CSV 字段说明，
+  以及「验证 A8 必须 none + sleep-us > 0」的原因。
+- ARCHITECTURE §3.1.2 增加 `yat_bench` 参数表与 CSV/SCHEMA 交叉引用；
+  §3.2.1 增加「决策链路成立的四个前提」表（对应 A8.1 的四个坑）；
+  §3.1.1 补充 `ttwu_*` 由 `yat_probe_ttwu()` 在 core.c 四个出口累加、只统计 yat 任务。
+- DIRECTORY 的 `boot_test_scripts/` 与 `yat_test_scripts/` 清单按 A7 约定更正
+  （脚本不再混在 C 源码目录、补上 `compare_cfs_vs_yat.sh` 与 `yat_bench.c`）。
 
 ---
 
@@ -801,3 +902,24 @@ guest **静默挂死**（串口无输出、4 个 vCPU 全部 idle、`jobs_placed
 - **锁序需审查**：`balance_yat_casched()`（CPU0）在持 `yat_pool_lock` 时再 `rq_lock(target)`，
   与 `global_dag_lock` / `yat_accel_table.lock` 的相对顺序需用 `lockdep` 验证
   （见 [`docs/ROADMAP.md`](docs/ROADMAP.md) A5）。
+
+## 2026-10-24 指标与论文证据修补
+- 修复负载均衡度负值及代理截止期释放时间/溢出问题，新增四项回归断言（106 项通过）。
+- 修订论文摘要及实验章，明确证据边界和复现协议。详见 docs/REPAIR_REVIEW_2026-10-24.md。
+
+- 续轮：归档理论章未追溯实验段落，撤下全局最优表述；WSL verify-all、kernel-obj 与论文构建通过，排版警告待处理。
+
+- 完成五种子500配对实验及QEMU既有镜像冒烟，归档 docs/validation/2026-10-24；修复 --no-viz 不导出CSV，新增导出集成回归检查；完善论文实现映射、实验结论、页锚点与占位图清理。
+
+## 2026-10-28
+- 固定CSV区域格式和UTF-8编码，CSV/元数据写入错误非零退出；新增跨区域与四种故障注入回归。
+
+## 2026-10-29
+- 修复多种子置信区间临界值截断和单样本零宽区间误导，新增统计边界回归；报告不再用改善阈值替代显著性判断。
+
+- 多种子输入修复：CLI覆盖后校验、重复种子拒绝、空列表元素拒绝及数组防御性复制；补充配置与CLI回归测试。
+
+- CLI严格校验：非正实验规模和未知选项以状态码2退出，防止无意运行不同配置。
+
+## 2026-10-30
+- 修复CLI单种子无法覆盖YAML多种子、环境配置缺失静默回落的问题；集成测试遵循JAVA_HOME，Windows隔离编译及116项断言通过。

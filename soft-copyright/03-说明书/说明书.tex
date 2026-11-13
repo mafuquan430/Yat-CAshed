@@ -684,13 +684,6 @@ YAT-AFFINITY PASS rc=0
 
 V1.0 相对上一版实现了就绪代际门禁，\autoref{fig:routea} 与表 \ref{tab:routea} 给出前后对比。
 
-\begin{figure}[htbp]
-\centering
-\includegraphics[width=0.80\textwidth]{figures/fig2-route-a.png}
-\caption{就绪代际门禁前后对比（左柱为优化前，右柱为优化后）}
-\label{fig:routea}
-\end{figure}
-
 \begin{table}[H]
 \centering
 \caption{版本间关键指标对比}
@@ -713,6 +706,14 @@ V1.0 相对上一版实现了就绪代际门禁，\autoref{fig:routea} 与表 \r
 "放置"一遍，这些放置不改变任何调度结果，只是把计数器撑大；新实现只放置真正需要放置的作业，
 接管率反而从 97.9\% 升到 98.1\%。判断一个计数变小是好事还是坏事，要看它对应的行为是否产生
 实际效果，而不是看数字大小。
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.80\textwidth]{figures/fig2-route-a.png}
+\caption{就绪代际门禁前后对比（左柱为优化前，右柱为优化后）}
+\label{fig:routea}
+\end{figure}
+
 
 \subsection{如何判断一次运行的数据可信}
 

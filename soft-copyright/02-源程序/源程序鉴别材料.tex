@@ -1,0 +1,3617 @@
+\documentclass[10pt,a4paper]{article}
+\usepackage[UTF8,fontset=fandol]{ctex}
+\usepackage[a4paper,left=1.6cm,right=1.6cm,top=1.4cm,bottom=1.2cm,headheight=12pt,headsep=6pt,footskip=10pt]{geometry}
+\usepackage{fancyvrb}
+\usepackage{fancyhdr}
+\usepackage{lastpage}
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\small \texttt{Yat-CAShed 缓存感知调度软件} \ \texttt{V1.0}}
+\fancyhead[R]{\small 第 \thepage\ 页 / 共 \pageref{LastPage} 页}
+\renewcommand{\headrulewidth}{0.4pt}
+\fancyfoot[C]{}
+\setlength{\parindent}{0pt}
+\setlength{\topskip}{0pt}
+\newenvironment{yatpage}{\vspace*{0pt}}{\par}
+\begin{document}
+\pagestyle{fancy}
+\begin{yatpage}
+\begin{Verbatim}[fontsize=\fontsize{8.2}{9.8}\selectfont]
+/* ==================== 文件：linux-6.8-main/include/linux/sched/yat_casched.h ==================== */
+#ifndef _LINUX_SCHED_YAT_CASCHED_H
+#define _LINUX_SCHED_YAT_CASCHED_H
+#ifdef CONFIG_SCHED_CLASS_YAT_CASCHED
+/* 常量定义 */
+#define YAT_INVALID_CORE        (-1)
+#define YAT_MAX_DAG_PRIORITY    100
+/* 作业状态枚举 */
+enum yat_job_state {
+    YAT_JOB_WAITING = 0,
+    YAT_JOB_READY,
+    YAT_JOB_RUNNING,
+    YAT_JOB_COMPLETED
+};
+/*
+ * try_to_wake_up() 出口探针。
+ *
+ * core.c 在 try_to_wake_up() 的每个出口处调用 yat_probe_ttwu()，实现位于
+ * kernel/sched/yat_casched.c（只有目标是 yat 类的唤醒才会被计数）。
+ * 这四个出口穷尽了「一次唤醒为什么不生效」的全部可能，是 A8 实测定位
+ * 的核心手段：只看 jobs_placed 无法区分「唤醒被丢弃」与「唤醒了但没选核」。
+ */
+enum yat_ttwu_probe {
+    YAT_TTWU_STATE_BAIL = 0,    /* p->__state 与请求 state 不匹配，唤醒被丢弃 */
+    YAT_TTWU_RUNNABLE,          /* p->on_rq 为真：只做 wakeup，不 enqueue/不选核 */
+    YAT_TTWU_WAKELIST,          /* 目标核仍在 schedule() 中，投递到 wake_list */
+    YAT_TTWU_OK,                /* 正常路径：select_task_rq + ttwu_queue */
+};
+void yat_probe_ttwu(struct task_struct *p, int kind);
+/* 加速表哈希位数 (2^8 = 256个桶，用于(task,cpu)组合) */
+#define YAT_ACCEL_HASH_BITS    8
+/* 历史表哈希位数 (2^7 = 128个桶，用于时间戳) */
+#define YAT_HISTORY_HASH_BITS  7
+/* 前向声明哈希表节点 */
+struct hlist_node;
+/* 加速表条目：存储(task,cpu)→benefit映射 */
+struct yat_accel_entry {
+    struct hlist_node hash_node;   /* 哈希表节点 */
+    /*
+     * 仅供销毁/裁剪路径把「已从哈希表摘下的」条目串成临时链表，
+     * 以便把 kfree 推迟到释放 table->lock 之后。正常查找永远不会碰它。
+     */
+    struct list_head lru_list;
+    pid_t task_pid;                /* 任务PID */
+    int job_id;                    /* 作业ID (兼容性) */
+    int cpu_id;                    /* CPU编号 */
+    u64 benefit;                   /* 加速值（benefit） */
+    u64 wcet;                      /* 任务的WCET */
+    u64 crp_ratio;                 /* CRP比率（千分比表示，避免浮点） */
+    u64 last_update_time;          /* 最后更新时间 */
+};
+/* 加速表：二维哈希表，支持(task,cpu)→benefit查找 */
+struct yat_accel_table {
+    struct hlist_head *hash_buckets; /* 哈希桶数组 */
+    spinlock_t lock;               /* 全局锁 */
+\end{Verbatim}
+\end{yatpage}
+\newpage
+\begin{yatpage}
+\begin{Verbatim}[fontsize=\fontsize{8.2}{9.8}\selectfont]
+    u64 last_cleanup_time;         /* 上次清理时间 */
+};
+/* 历史表条目：存储时间戳→任务映射 */
+struct yat_history_entry {
+    struct hlist_node hash_node;   /* 哈希表节点 */
+    u64 timestamp;                 /* 时间戳作为键 */
+    struct task_struct *task;      /* 任务指针 */
+    u64 insert_time;               /* 插入时间 */
+};
+/* CPU历史表：每个CPU维护时间戳→任务的映射 */
+struct yat_cpu_history_table {
+    struct hlist_head *hash_buckets; /* 哈希桶数组 */
+    spinlock_t lock;               /* 该CPU历史表的锁 */
+    u64 last_cleanup_time;         /* 上次清理时间 */
+    struct list_head time_list;    /* 时间链表 */
+    /*
+     * 链表长度。用于在插入路径上做软限流（见 yat_add_history_record）：
+     * 原实现只增不删，一次长时间压测下来每条链表可以涨到几十万条，
+     * 而 yat_get_task_last_timestamp()/yat_sum_exec_time_since() 每次
+     * 都要全链表扫描 —— 持锁线性扫描 = 调度器 O(n) 抖动。
+     */
+    unsigned int nr_records;
+};
+/* 历史记录条目：基于链表的历史表实现 */
+struct yat_history_record {
+    struct list_head list;         /* 链表节点 */
+    int job_id;                    /* 作业ID */
+    u64 timestamp;                 /* 时间戳 */
+    u64 exec_time;                 /* 执行时间 */
+};
+/* 就绪作业池 */
+struct yat_ready_job_pool {
+    struct list_head head;         /* 就绪作业链表头 */
+    spinlock_t lock;               /* 就绪池锁 */
+    unsigned int nr_jobs;          /* 就绪作业数量 */
+};
+/* DAG任务结构 */
+struct yat_dag_task {
+    struct list_head dag_list;     /* DAG链表节点 */
+    struct list_head jobs;         /* 作业链表头 */
+    int dag_id;                    /* DAG ID */
+    int priority;                  /* DAG优先级 */
+    int total_jobs;                /* 总作业数 */
+    int completed_jobs;            /* 已完成作业数 */
+    spinlock_t lock;               /* DAG锁 */
+};
+/* 作业结构 */
+struct yat_job {
+    struct list_head ready_list;   /* 就绪队列链表节点 */
+    struct list_head job_list;     /* DAG作业链表节点 */
+    struct list_head predecessors; /* 前驱作业列表 */
+    struct list_head successors;   /* 后继作业列表 */
+    int job_id;                    /* 作业ID */
+    int job_priority;              /* 作业优先级 */
+    enum yat_job_state state;      /* 作业状态 */
+\end{Verbatim}
+\end{yatpage}
+\newpage
+\begin{yatpage}
+\begin{Verbatim}[fontsize=\fontsize{8.2}{9.8}\selectfont]
+    int pending_predecessors;      /* 待完成的前驱作业数 */
+    /*
+     * AJLR 最近一次为该作业选定的目标核心（YAT_INVALID_CORE 表示尚未决策）。
+     *
+     * 这个字段是「决策」与「执行」之间的唯一交接点：
+     *   - 写入者：select_task_rq_yat_casched()（唤醒时落地）与
+     *             yat_schedule_ajlr()（全局复核时刷新）；
+     *   - 读取者：debugfs 与 trace，用于判断「实际运行的核」是否等于
+     *             算法选出的核（两者不等说明亲和性/迁移策略覆盖了决策）。
+     * 它不参与锁保护：单写多读的普通 int，读到陈旧值只影响观测，不影响
+     * 调度正确性。
+     */
+    int assigned_cpu;
+    /*
+     * 上一次为 assigned_cpu 做全量决策的时间（ktime_get_ns）。
+     *
+     * 决策本身是 O(nr_cpus^2)（yat_calculate_recency() 内部对每个 CPU
+     * 再扫一遍 online CPU 的历史表），而 select_task_rq() 在每次
+     * try_to_wake_up() 上都会调用。若不加节流，一次唤醒就要几千次
+     * 哈希桶遍历，抖动会直接淹没调度收益。
+     *
+     * 因此决策遵循「粘性 + 最小间隔」：
+     *   - 目标核仍空闲（nr_running == 0）→ 直接复用，不重算；
+     *   - 距上次决策不足 YAT_DECISION_MIN_INTERVAL_NS → 复用；
+     *   - 否则才重新跑 yat_find_best_core_for_job()。
+     * 与 assigned_cpu 一样，普通字段，无锁保护，读到陈旧值只影响
+     * 「这次要不要重算」的判断，不影响正确性。
+     */
+    u64 last_decision_ns;
+    u64 wcet;                      /* 最坏情况执行时间 */
+    /*
+     * 原 per_cpu_last_ts[NR_CPUS] 已删除：它是纯写字段（三处写入、零处读取），
+     * 却让每个 struct yat_job 常驻 NR_CPUS * 8 字节（64 核即 512B）。
+     * "某 CPU 上该作业最后出现的时间" 统一由 global_history_tables[cpu]
+     * 的链表查询得出（yat_get_task_last_timestamp），单一事实来源。
+     */
+    struct yat_dag_task *dag;      /* 所属DAG */
+    struct task_struct *task;      /* 关联的任务 */
+};
+struct sched_yat_casched_entity {
+    struct list_head run_list;      /* 运行队列链表节点 */
+    u64 vruntime;                   /* 虚拟运行时间 */
+    u64 slice;                      /* 时间片，与CFS保持一致 */
+    int last_cpu;                   /* 上次运行的CPU */
+    u64 per_cpu_recency[NR_CPUS];   /* 每个CPU的recency值 */
+    u64 wcet;                       /* 任务的WCET */
+    int priority;                   /* 任务优先级 */
+    struct yat_job *job;            /* 关联的作业 */
+};
+struct yat_casched_rq {
+    struct list_head tasks;         /* 任务队列 */
+    struct list_head active_dags;   /* 活跃DAG列表 */
+    unsigned int nr_running;        /* 运行任务数量 */
+    struct task_struct *agent;     /* 代理任务 */
+    u64 cache_decay_jiffies;       /* 缓存衰减时间 */
+\end{Verbatim}
+\end{yatpage}
+\newpage
+\begin{yatpage}
+\begin{Verbatim}[fontsize=\fontsize{8.2}{9.8}\selectfont]
+    spinlock_t history_lock;       /* 历史表锁 */
+    /* 全局调度结构（指向全 CPU 共享实例，不拥有所有权） */
+    struct yat_ready_job_pool *ready_pool;            /* 就绪作业池 */
+    struct yat_accel_table *accel_table;              /* 加速表 */
+    /*
+     * 原实现内嵌了 history_tables[NR_CPUS]，即每个 rq 都持有一整套
+     * NR_CPUS 张历史表 —— 而真正被使用的始终是全局的 global_history_tables，
+     * 这份内嵌副本只在 rq_offline 里被销毁，纯属 NR_CPUS² 的内存浪费
+     * （64 核约 64*(2*8+32+16) ≈ 40KB+rq）。已删除，历史表只保留全局一份。
+     */
+};
+struct rq;
+struct task_struct;
+struct rq_flags;  /* 添加rq_flags的前向声明 */
+struct affinity_context;  /* 添加affinity_context的前向声明 */
+void init_yat_casched_rq(struct yat_casched_rq *rq);
+bool yat_casched_prio(struct task_struct *p);
+void update_curr_yat_casched(struct rq *rq);
+/* 加速表接口 */
+int yat_accel_table_init(struct yat_accel_table *table);
+void yat_accel_table_destroy(struct yat_accel_table *table);
+int yat_accel_table_insert(struct yat_accel_table *table, pid_t task_pid, int cpu_id, u64 
+    benefit, u64 wcet, u64 crp_ratio);
+int yat_accel_table_update(struct yat_accel_table *table, pid_t task_pid, int cpu_id, u64 
+    benefit, u64 wcet, u64 crp_ratio);
+u64 yat_accel_table_lookup(struct yat_accel_table *table, pid_t task_pid, int cpu_id);
+int yat_accel_table_delete(struct yat_accel_table *table, pid_t task_pid, int cpu_id);
+void yat_accel_table_cleanup(struct yat_accel_table *table, u64 before_time);
+/* DAG和作业管理接口 */
+struct yat_dag_task *yat_create_dag(int dag_id, int priority);
+void yat_destroy_dag(struct yat_dag_task *dag);
+struct yat_job *yat_create_job(int job_id, int job_priority, u64 wcet, struct yat_dag_task
+     *dag);
+void yat_destroy_job(struct yat_job *job);
+void yat_job_add_dependency(struct yat_job *job, struct yat_job *predecessor);
+void yat_job_complete(struct yat_job *job);
+/* Linux 任务 <-> AJLR 作业 绑定接口 */
+struct yat_job *yat_create_job_for_task(struct task_struct *task, int job_priority,
+					u64 wcet, struct yat_dag_task *dag);
+void yat_complete_task_job(struct task_struct *task);
+/* 内核态自测入口（调试用） */
+void yat_create_test_dag(void);
+/* AJLR算法接口 */
+u64 yat_calculate_recency(int job_id, int cpu_id, u64 now);
+u64 yat_calculate_impact(struct yat_job *job, int core);
+int yat_find_best_core_for_job(struct yat_job *job);
+void yat_schedule_ajlr(struct yat_casched_rq *rq);
+void yat_update_ready_pool(struct yat_casched_rq *rq);
+u64 yat_get_crp_ratio(u64 recency);
+u64 yat_get_max_last_exec_time(int job_id, int *cpu_list, int cpu_count);
+u64 yat_sum_exec_time_multi(int *cpu_list, int cpu_count, u64 start_ts, u64 end_ts);
+void yat_cleanup_old_records(int cpu, u64 cutoff_time);
+void enqueue_task_yat_casched(struct rq *rq, struct task_struct *p, int flags);
+void dequeue_task_yat_casched(struct rq *rq, struct task_struct *p, int flags);
+struct task_struct *pick_next_task_yat_casched(struct rq *rq);
+\end{Verbatim}
+\end{yatpage}
+\newpage
+\begin{yatpage}
+\begin{Verbatim}[fontsize=\fontsize{8.2}{9.8}\selectfont]
+void set_next_task_yat_casched(struct rq *rq, struct task_struct *p, bool first);
+void put_prev_task_yat_casched(struct rq *rq, struct task_struct *p);
+void task_tick_yat_casched(struct rq *rq, struct task_struct *p, int queued);
+void yield_task_yat_casched(struct rq *rq);
+bool yield_to_task_yat_casched(struct rq *rq, struct task_struct *p);
+void wakeup_preempt_yat_casched(struct rq *rq, struct task_struct *p, int flags);
+int balance_yat_casched(struct rq *rq, struct task_struct *prev, struct rq_flags *rf);
+int select_task_rq_yat_casched(struct task_struct *p, int cpu, int flags);
+void set_cpus_allowed_yat_casched(struct task_struct *p, struct affinity_context *ctx);
+void rq_online_yat_casched(struct rq *rq);
+void rq_offline_yat_casched(struct rq *rq);
+struct task_struct *pick_task_yat_casched(struct rq *rq);
+void switched_to_yat_casched(struct rq *rq, struct task_struct *p);
+void prio_changed_yat_casched(struct rq *rq, struct task_struct *p, int oldprio);
+extern const struct sched_class yat_casched_sched_class;
+#else
+static inline void init_yat_casched_rq(struct yat_casched_rq *rq) { }
+#endif /* CONFIG_SCHED_CLASS_YAT_CASCHED */
+#endif /* _LINUX_SCHED_YAT_CASCHED_H */
+/* ==================== 文件：linux-6.8-main/include/trace/events/yat_casched.h ==================== */
+/* SPDX-License-Identifier: GPL-2.0-only */
+#undef TRACE_SYSTEM
+#define TRACE_SYSTEM yat_casched
+#if !defined(_TRACE_YAT_CASCHED_H) || defined(TRACE_HEADER_MULTI_READ)
+#define _TRACE_YAT_CASCHED_H
+#include <linux/tracepoint.h>
+/*
+ * Yat_CASched 可观测性接口
+ *
+ * 为什么必须用 tracepoint 而不是 printk：
+ *   调度类的 enqueue/dequeue/pick_next_task/balance 全部跑在持 rq_lock、
+ *   可能关中断的上下文里。printk 会同步写控制台、可能触发唤醒与 sleep，
+ *   在高频路径上既违反「原子上下文不得睡眠」的约束，又会因为偷走 CPU
+ *   时间而系统性改变被测调度行为（观察者效应）。tracepoint 在未启用时
+ *   只多一次静态分支判断，启用后写入 per-CPU 环形缓冲区，不做同步 I/O。
+ *
+ * 查看方式：
+ *   cd /sys/kernel/tracing
+ *   echo 1 > events/yat_casched/enable
+ *   cat trace_pipe
+ * 或用 perf / trace-cmd 采集后离线分析（A7 的 CFS vs Yat 对比即基于此）。
+ */
+/*
+ * 作业被投入就绪池。
+ * @pid:      关联任务的 pid（无关联任务时为 0）
+ * @job_id:   作业 ID
+ * @prio:     作业优先级（数值越小越优先）
+ * @nr_jobs:  入队后就绪池中的作业数
+ */
+TRACE_EVENT(yat_casched_enqueue,
+	TP_PROTO(int pid, int job_id, int prio, int nr_jobs),
+	TP_ARGS(pid, job_id, prio, nr_jobs),
+	TP_STRUCT__entry(
+		__field(int, pid)
+		__field(int, job_id)
+\end{Verbatim}
+\end{yatpage}
+\newpage
+\begin{yatpage}
+\begin{Verbatim}[fontsize=\fontsize{8.2}{9.8}\selectfont]
+		__field(int, prio)
+		__field(int, nr_jobs)
+	),
+	TP_fast_assign(
+		__entry->pid		= pid;
+		__entry->job_id		= job_id;
+		__entry->prio		= prio;
+		__entry->nr_jobs	= nr_jobs;
+	),
+	TP_printk("pid=%d job_id=%d prio=%d nr_jobs=%d",
+		  __entry->pid, __entry->job_id, __entry->prio,
+		  __entry->nr_jobs)
+);
+/*
+ * 作业被从就绪池取出准备分配。
+ */
+TRACE_EVENT(yat_casched_dequeue,
+	TP_PROTO(int pid, int job_id, int nr_jobs),
+	TP_ARGS(pid, job_id, nr_jobs),
+	TP_STRUCT__entry(
+		__field(int, pid)
+		__field(int, job_id)
+		__field(int, nr_jobs)
+	),
+	TP_fast_assign(
+		__entry->pid		= pid;
+		__entry->job_id		= job_id;
+		__entry->nr_jobs	= nr_jobs;
+	),
+	TP_printk("pid=%d job_id=%d nr_jobs=%d",
+		  __entry->pid, __entry->job_id, __entry->nr_jobs)
+);
+/*
+ * AJLR 为一个作业选出目标核心。
+ * @job_id:   作业 ID
+ * @cpu:      被选中的核心
+ * @benefit:  该核心上的缓存收益估算
+ * @crp_ratio: CRP 比率（千分比，避免浮点）
+ * @wcet:     作业的 WCET
+ */
+TRACE_EVENT(yat_casched_place,
+	TP_PROTO(int job_id, int cpu, u64 benefit, u64 crp_ratio, u64 wcet),
+	TP_ARGS(job_id, cpu, benefit, crp_ratio, wcet),
+	TP_STRUCT__entry(
+		__field(int, job_id)
+		__field(int, cpu)
+		__field(u64, benefit)
+		__field(u64, crp_ratio)
+		__field(u64, wcet)
+	),
+	TP_fast_assign(
+		__entry->job_id		= job_id;
+		__entry->cpu		= cpu;
+		__entry->benefit	= benefit;
+		__entry->crp_ratio	= crp_ratio;
+\end{Verbatim}
+\end{yatpage}
+\newpage
+\begin{yatpage}
+\begin{Verbatim}[fontsize=\fontsize{8.2}{9.8}\selectfont]
+		__entry->wcet		= wcet;
+	),
+	TP_printk("job_id=%d cpu=%d benefit=%llu crp_ratio=%llu wcet=%llu",
+		  __entry->job_id, __entry->cpu,
+		  (unsigned long long)__entry->benefit,
+		  (unsigned long long)__entry->crp_ratio,
+		  (unsigned long long)__entry->wcet)
+);
+/*
+ * 唤醒选核：select_task_rq() 里真正落地 AJLR 决策的地方。
+ *
+ * 与 yat_casched_place 的区别：
+ *   - yat_casched_place 由 yat_find_best_core_for_job() 在「评估候选核心」
+ *     时发出，属于算法内部视角，可能被调用多次（每次全局复核都会重扫）；
+ *   - 本事件只在 select_task_rq() 真正把返回值交给内核时发出一次，
+ *     是「决策被采纳」的唯一凭据。prev_cpu 是任务睡眠前所在核，
+ *     target_cpu 是本次选出的核 —— 两者不等才意味着真实迁移。
+ *
+ * @pid:        被唤醒的任务
+ * @job_id:     其作业 ID
+ * @prev_cpu:   唤醒前的 CPU（内核传入的 task_cpu）
+ * @target_cpu: AJLR 选出的目标 CPU
+ * @prio:       作业优先级快照
+ */
+TRACE_EVENT(yat_casched_wakeup_place,
+	TP_PROTO(int pid, int job_id, int prev_cpu, int target_cpu, int prio),
+	TP_ARGS(pid, job_id, prev_cpu, target_cpu, prio),
+	TP_STRUCT__entry(
+		__field(int, pid)
+		__field(int, job_id)
+		__field(int, prev_cpu)
+		__field(int, target_cpu)
+		__field(int, prio)
+	),
+	TP_fast_assign(
+		__entry->pid		= pid;
+		__entry->job_id		= job_id;
+		__entry->prev_cpu	= prev_cpu;
+		__entry->target_cpu	= target_cpu;
+		__entry->prio		= prio;
+	),
+	TP_printk("pid=%d job_id=%d prev_cpu=%d target_cpu=%d prio=%d%s",
+		  __entry->pid, __entry->job_id, __entry->prev_cpu,
+		  __entry->target_cpu, __entry->prio,
+		  __entry->prev_cpu == __entry->target_cpu ? " (stay)" : " (migrate)")
+);
+/*
+ * pick_next_task 选中某个任务。
+ * @cpu:        运行队列所在 CPU
+ * @pid:        被选中的任务
+ * @job_id:     其作业 ID（无作业为 -1）
+ * @nr_running: 该类在本 CPU 上的就绪任务数
+ */
+TRACE_EVENT(yat_casched_pick,
+	TP_PROTO(int cpu, int pid, int job_id, unsigned int nr_running),
+\end{Verbatim}
+\end{yatpage}
+\newpage
+\begin{yatpage}
+\begin{Verbatim}[fontsize=\fontsize{8.2}{9.8}\selectfont]
+	TP_ARGS(cpu, pid, job_id, nr_running),
+	TP_STRUCT__entry(
+		__field(int, cpu)
+		__field(int, pid)
+		__field(int, job_id)
+		__field(unsigned int, nr_running)
+	),
+	TP_fast_assign(
+		__entry->cpu		= cpu;
+		__entry->pid		= pid;
+		__entry->job_id		= job_id;
+		__entry->nr_running	= nr_running;
+	),
+	TP_printk("cpu=%d pid=%d job_id=%d nr_running=%u",
+		  __entry->cpu, __entry->pid, __entry->job_id,
+		  __entry->nr_running)
+);
+/*
+ * 任务切出时写入历史表的一段执行区间。
+ * 这是 CRP 的唯一真实数据来源；exec_time 为 0 的区间不会产生事件，
+ * 因此本 tracepoint 的事件数应当与真实上下文切换次数同量级。
+ */
+TRACE_EVENT(yat_casched_account,
+	TP_PROTO(int cpu, int job_id, u64 exec_time),
+	TP_ARGS(cpu, job_id, exec_time),
+	TP_STRUCT__entry(
+		__field(int, cpu)
+		__field(int, job_id)
+		__field(u64, exec_time)
+	),
+	TP_fast_assign(
+		__entry->cpu		= cpu;
+		__entry->job_id		= job_id;
+		__entry->exec_time	= exec_time;
+	),
+	TP_printk("cpu=%d job_id=%d exec_time=%llu",
+		  __entry->cpu, __entry->job_id,
+		  (unsigned long long)__entry->exec_time)
+);
+#endif /* _TRACE_YAT_CASCHED_H */
+/* This part must be outside protection */
+#include <trace/define_trace.h>
+/* ==================== 文件：linux-6.8-main/kernel/sched/yat_casched.c ==================== */
+/*
+ * Yat-CAShed - AJLR层级化DAG调度器 (Decision Final Version)
+ *
+ * 基于AJLR (Allocation of parallel Jobs based on Learned cache Recency)思想的
+ * 层级化调度器实现：
+ *
+ * 核心特性：
+ * - DAG层：遵循全局固定优先级（gFPS），高优先级DAG的"就绪"作业优先被调度
+ * - 作业层：利用"加速表"和"历史表"，做出最优的（作业，核心）分配决策
+ * - 就绪作业优先队列统一管理所有待调度作业
+ * - 二维加速表支持(job,cpu)→benefit查找
+ * - 双向链表历史表记录时间戳→任务映射关系
+\end{Verbatim}
+\end{yatpage}
+\newpage
+\begin{yatpage}
+\begin{Verbatim}[fontsize=\fontsize{8.2}{9.8}\selectfont]
+ * - 采用AJLR的LCIF/MSF调度算法
+ */
+#include "sched.h"
+#include <linux/sched/yat_casched.h>
+#include <linux/hashtable.h>
+#include <linux/slab.h>
+#include <linux/types.h>
+#include <linux/kernel.h>
+#include <linux/ktime.h>
+#include <linux/list.h>
+#include <linux/hash.h>
+#include <linux/errno.h>
+#include <linux/gfp.h>
+#include <linux/jiffies.h>
+#include <linux/string.h>
+#include <linux/spinlock.h>
+#include <linux/cpumask.h>
+#include <linux/smp.h>
+#include <linux/limits.h>
+#include <linux/percpu.h>
+#include <linux/debugfs.h>
+#include <linux/seq_file.h>
+/*
+ * tracepoint 实例化点。
+ *
+ * CREATE_TRACE_POINTS 必须恰好出现在**一个** .c 文件里，且要在
+ * include 之前定义，否则 <trace/define_trace.h> 会为每个 TRACE_EVENT
+ * 生成重复定义。这里就是 Yat_CASched 的唯一实例化点。
+ */
+#define CREATE_TRACE_POINTS
+#include <trace/events/yat_casched.h>
+/* 缓存热度阈值（jiffies）*/
+#define YAT_CACHE_HOT_TIME	(HZ / 100)	/* 10ms */
+#define YAT_MIN_GRANULARITY	(NSEC_PER_SEC / 1000)	/* 1ms - 更短的时间片 */
+#define YAT_TIME_SLICE		(4 * NSEC_PER_MSEC)	/* 4ms 默认时间片 */
+/*
+ * 普通任务的默认 WCET。
+ *
+ * 用户态没有提供 WCET 的接口（SCHED_YAT_CASCHED 的 sched_priority 只有
+ * 0..19），所以绑定到 task_struct 的隐式作业统一用 1ms：
+ *   - 这是 yat_find_best_core_for_job() 里 benefit = (1000-crp)*wcet/1000
+ *     的乘数，同一个值对**所有**任务都成立时，排序完全由 crp 决定 ——
+ *     正是 AJLR 想要的「缓存热度优先」语义，不会被 WCET 差异干扰；
+ *   - 若将来需要区分 WCET，应通过 sched_attr 扩展或 debugfs 注入，
+ *     而不是在这里按 pid 猜。
+ */
+#define YAT_DEFAULT_WCET_NS	1000000ULL	/* 1ms */
+/*
+ * 两个连续的「全量选核」之间至少间隔这么久。
+ *
+ * 取值理由：yat_find_best_core_for_job() 的收益来自「任务换核后仍能命中
+ * 上次留在该核缓存里的数据」。缓存的半衰期是数十微秒到毫秒量级，
+ * 而重新决策的成本是 O(nr_cpus^2) 次历史表桶遍历。1ms 既远小于缓存
+ * 完全失效的时间，又能把每任务每秒的决策次数压到 1000 次以内。
+ * 在 64 核上这相当于把选核开销从「每次唤醒几万次桶访问」降到可忽略。
+\end{Verbatim}
+\end{yatpage}
+\newpage
+\begin{yatpage}
+\begin{Verbatim}[fontsize=\fontsize{8.2}{9.8}\selectfont]
+ */
+#define YAT_DECISION_MIN_INTERVAL_NS	1000000ULL	/* 1ms */
+/* 每个 CPU 历史表的软上限，超过后触发一次惰性裁剪，防止无限增长 */
+#define YAT_HISTORY_MAX_RECORDS	512
+/*
+ * 单次 balance 回调最多分配多少个作业。
+ * 纯粹是防御性上限：防止某条状态机 bug 让就绪池反复投喂同一作业时，
+ * 调度器在软中断上下文里无限循环。正常负载下远达不到这个数。
+ */
+#define YAT_BALANCE_MAX_BATCH	256
+/*
+ * ============================================================================
+ * 加锁规则（**修改本文件前必须先读这一段**）
+ * ============================================================================
+ *
+ * 本调度类里一共有四把锁，加锁顺序（从外到内）必须严格遵守：
+ *
+ *   rq_lock(rq)                        -- 由核心调度器持有，本文件从不主动获取
+ *     └─ global_dag_lock               -- 保护 global_dag_list / dag_id 分配
+ *          └─ dag->lock                -- 保护 dag->jobs、total_jobs、completed_jobs
+ *               └─ pool->lock          -- 保护 struct yat_ready_job_pool
+ *     └─ global_history_tables[c].lock -- 保护该 CPU 的历史记录链表
+ *     └─ table->lock                   -- 保护加速表哈希桶
+ *
+ * 约束：
+ *
+ * 1. 唯一的嵌套链是 global_dag_lock -> dag->lock -> pool->lock：
+ *    - yat_update_ready_pool() 持 global_dag_lock + dag->lock，
+ *      在内层调 yat_ready_pool_enqueue() 取 pool->lock；
+ *    - yat_destroy_dag() 同样在 dag->lock 内调 yat_ready_pool_remove()。
+ *    这条链的方向**不可反转** —— 任何先取 pool->lock 再取
+ *    global_dag_lock/dag->lock 的写法都会构成 ABBA 死锁。
+ *    其余锁（历史表、加速表）与任何锁都不嵌套：它们只在局部临界区里
+ *    保护单一链表/哈希桶。任何新增的嵌套都会引入 ABBA 死锁风险，
+ *    必须在此处登记。
+ *
+ * 2. **禁止在持锁期间睡眠式分配**。所有 kmalloc/kfree 都必须移到临界区之外：
+ *    - 分配：持锁前用 GFP_ATOMIC/GFP_KERNEL 分配好，失败就放弃本次操作；
+ *    - 释放：持锁期间只做 list_del/hlist_del，把节点挂到栈上的临时链表，
+ *      解锁后再统一 kfree。kfree 可能进入回收器，持自旋锁调用是 UC 的。
+ *
+ * 3. `enqueue_task_yat_casched()/dequeue_task_yat_casched()` 的调用者
+ *    （核心调度器）已经持有 rq_lock，`rq->yat_casched.tasks` 由 rq_lock
+ *    保护。**不要**再引入 yat_pool_lock —— 它保护的 `yat_ready_job_pool`
+ *    是另一份数据（作业就绪池），与 rq 的运行队列无关。
+ *
+ * 4. `balance_yat_casched()` 只在 CPU0 上执行全局分配，此时 rq_lock(CPU0)
+ *    被持有。因此 `yat_schedule_ajlr()` 及其下游（yat_update_ready_pool、
+ *    yat_find_best_core_for_job、yat_add_history_record）全部运行在
+ *    「持 CPU0 rq_lock + 可能关中断」的上下文里：只能 GFP_ATOMIC、
+ *    不能 mutex、不能 schedule()。
+ *
+ * 5. `for_each_online_cpu()` 下访问 `cpu_rq(cpu)->yat_casched` 只读字段
+ *    （nr_running）是允许的；**不要**在未持该 CPU rq_lock 时写入其 rq。
+ * ============================================================================
+\end{Verbatim}
+\end{yatpage}
+\newpage
+\begin{yatpage}
+\begin{Verbatim}[fontsize=\fontsize{8.2}{9.8}\selectfont]
+ */
+/* 全局数据结构 */
+static struct yat_ready_job_pool *global_ready_pool = NULL;     /* 就绪作业池 */
+static struct yat_accel_table *global_accel_table = NULL;       /* 加速表 */
+static struct yat_cpu_history_table global_history_tables[NR_CPUS]; /* 历史表 */
+static struct list_head global_dag_list = LIST_HEAD_INIT(global_dag_list); /* 活动DAG列表 
+    */
+static DEFINE_SPINLOCK(global_dag_lock);                       /* DAG列表锁 */
+static struct yat_dag_task *global_default_dag;                /* 传统任务的默认DAG */
+/*
+ * 就绪代际（Route A）。
+ *
+ * 问题：balance 回调无条件调用 yat_update_ready_pool()，而它要在
+ * global_dag_lock 下遍历所有 DAG、每个 DAG 下再遍历所有作业。实测
+ * balance_runs = 757 而唤醒只有 512 次 —— 绝大多数调用发生时池里
+ * 并没有任何新东西，扫描纯属浪费；而且在 TCG 下每次取自旋锁都要
+ * 付出跨 vCPU 的代价。
+ *
+ * 做法：把"某个作业变成就绪"记成一个全局代际号 yat_ready_gen。
+ *   - 作业创建时无前驱            → 已就绪，代际 +1；
+ *   - 作业的最后一个前驱完成       → 就绪，代际 +1；
+ *   - balance 只在代际变化时扫描，并把 yat_scanned_gen 推进到快照值；
+ *   - 并发发生的就绪事件会让代际再次变化，因此不会漏扫。
+ * 池空且代际未变时，balance 连 yat_balance_lock 都不取就返回。
+ */
+static atomic_t yat_ready_gen = ATOMIC_INIT(0);		/* 就绪事件代际 */
+static atomic_t yat_scanned_gen = ATOMIC_INIT(-1);	/* 上次扫描看到的代际 */
+static atomic_t next_dag_id = ATOMIC_INIT(1);                  /* DAG ID分配器 */
+static atomic_t next_job_id = ATOMIC_INIT(1);                  /* 作业ID分配器 */
+/*
+ * 低开销统计计数器（A6）。
+ *
+ * 这些量每次调度都会更新，因此必须是 per-CPU 的普通加法（无锁、无原子
+ * 操作）；读取时统一用 for_each_possible_cpu() 求和，允许读到略微不一致
+ * 的快照 —— 统计量不需要线性一致。
+ *
+ * 与 tracepoint 的分工：
+ *   - tracepoint 记录**事件序列**（谁在何时被分配到哪个核），用于离线分析；
+ *   - 这里的计数器给出**运行中的总量**（经过多少次 balance、迁移多少次），
+ *     用于 debugfs 一眼查看，不需要开 trace。
+ */
+struct yat_casched_stats {
+	u64 balance_runs;	/* balance 回调真正拿到全局锁的次数 */
+	u64 balance_skips;	/* 抢锁失败、本次跳过的次数（说明争用程度） */
+	u64 balance_noop;	/* 池空且无新就绪：连全局锁都没取的"空转"次数 */
+	u64 pool_scans;		/* 真正执行了就绪池全表扫描的次数 */
+	u64 pool_scan_skips;	/* 代际未变、跳过全表扫描的次数 */
+	u64 jobs_placed;	/* AJLR 成功完成 (job, cpu) 分配的次数 */
+	u64 jobs_nocore;	/* 就绪作业但找不到可用核心的次数 */
+	u64 history_records;	/* 写入历史表的执行区间条数 */
+	u64 accel_inserts;	/* 加速表成功插入条数 */
+	u64 accel_dup;		/* 加速表重复条目（EEXIST）次数 */
+	/*
+	 * select_task_rq 链路的探针（A8 实测定位用）。
+	 *
+\end{Verbatim}
+\end{yatpage}
+\newpage
+\begin{yatpage}
+\begin{Verbatim}[fontsize=\fontsize{8.2}{9.8}\selectfont]
+	 * 这几个计数器的唯一目的是回答一个问题：**调度类回调到底有没有被
+	 * 核心调度器调用，如果调用了，又在哪一步退出**。
+	 *
+	 * 背景：core.c 的两处短路会让回调根本不被调用 ——
+	 *   (1) 包装层 `if (p->nr_cpus_allowed > 1)`：任务一旦被 pin 到单个
+	 *       CPU（nr_cpus_allowed == 1），直接 cpumask_any() 返回，回调
+	 *       一行都不会执行；
+	 *   (2) ttwu 快路径：`if (p->on_cpu && ttwu_queue_wakelist(...))`，
+	 *       任务还在别的核上运行时唤醒走 wakelist，select_task_rq() 被
+	 *       整段跳过。
+	 * 只靠 jobs_placed 无法区分「没被调用」和「调用了但早退」，
+	 * 因此下面按退出点逐个计数。
+	 */
+	u64 select_calls;		/* 进入 select_task_rq_yat_casched() */
+	u64 select_not_ttwu;		/* 非唤醒路径（WF_FORK / WF_EXEC）直接返回 */
+	u64 select_nojob;		/* yat_get_or_create_job() 失败 */
+	u64 select_sticky_idle;		/* 节流(a)：上次目标核空闲，复用旧决策 */
+	u64 select_sticky_interval;	/* 节流(b)：距上次决策不足最小间隔 */
+	u64 select_nocore;		/* 扫遍所有核也没有可用核心 */
+	u64 select_decided;		/* 真正跑完 AJLR 并返回新核心 */
+	/*
+	 * enqueue 侧探针：用来回答「为什么 select_task_rq 没被调用」。
+	 *
+	 * core.c:3644 的包装层只有在 p->nr_cpus_allowed > 1 时才会转发到
+	 * 调度类回调，否则直接 cpumask_any()。enqueue 是每个任务每次入队
+	 * 必经的路径，在这里采样 nr_cpus_allowed 的**总和**与**次数**，
+	 * 两者的商就是平均可运行 CPU 数：若恒为 1，说明任务被 pin 死了
+	 * （或被 cpuset 限制），select_task_rq 不可能是我们的问题。
+	 */
+	u64 enq_calls;			/* enqueue_task_yat_casched() 调用次数 */
+	u64 enq_cpus_allowed_sum;	/* 上述每次调用时 nr_cpus_allowed 之和 */
+	/*
+	 * try_to_wake_up() 探针（A8 实测定位用）。
+	 *
+	 * 只统计「被唤醒的任务属于 yat 调度类」的那些唤醒，因此不会
+	 * 被 guest 里其它 CFS 任务的唤醒稀释。四个计数器恰好覆盖
+	 * try_to_wake_up() 的全部出口：
+	 *   ttwu_state_bail —— p->__state 与请求的 state 不匹配，唤醒被丢弃；
+	 *   ttwu_runnable   —— p->on_rq 仍为真，判定为「可运行」，只做
+	 *                      ttwu_do_wakeup()，**不 enqueue、不 select_task_rq**；
+	 *   ttwu_wakelist   —— 目标核还在 schedule() 里引用 p，投递到
+	 *                      wake_list，稍后由对端核 enqueue（同样不 select）；
+	 *   ttwu_ok         —— 走完 select_task_rq + ttwu_queue 的正常唤醒。
+	 */
+	u64 ttwu_state_bail;
+	u64 ttwu_runnable;
+	u64 ttwu_wakelist;
+	u64 ttwu_ok;
+	/*
+	 * pick/dequeue 计数（A8 实测定位用）。
+	 *
+	 * pick_null_desync 是「核心层认为本核有可运行任务，但 yat 类认为
+	 * 队列为空」的次数。两者一旦失步，__pick_next_task() 会一路落到
+	 * idle 类返回 idle 任务 —— CPU 从此空转、任务永远不被调度，而且
+	 * 因为没有唤醒事件，try_to_wake_up() 一次都不会被调用，现象就是
+\end{Verbatim}
+\end{yatpage}
+\newpage
+\begin{yatpage}
+\begin{Verbatim}[fontsize=\fontsize{8.2}{9.8}\selectfont]
+	 * 「guest 静默挂死、所有 CPU 空闲、ttwu 探针全 0」。
+	 */
+	u64 pick_calls;			/* pick_next_task_yat_casched() 调用次数 */
+	u64 pick_null_desync;		/* yat 队列空但 rq->nr_running > 0 */
+	u64 deq_calls;			/* dequeue_task_yat_casched() 调用次数 */
+	u64 deq_sleep;			/* 其中因阻塞而 dequeue 的次数 */
+	/*
+	 * AJLR 接管率（累计值）。
+	 *
+	 * debugfs 的 placements 表是**实时快照**：任务退出时 job 随之释放，
+	 * 所以 workload 结束后表必然是空的。这三个计数器在 pick 时累加，
+	 * 与任务生命周期无关，才是「算法决策最终有没有被内核执行」的
+	 * 可留存证据。
+	 */
+	u64 place_hit;			/* 被选中的任务正好运行在 assigned_cpu 上 */
+	u64 place_miss;			/* 运行核与 assigned_cpu 不一致（决策被否决） */
+	u64 place_pending;		/* 尚未决策（assigned_cpu 无效）仍被选中 */
+};
+static DEFINE_PER_CPU(struct yat_casched_stats, yat_stats);
+/* debugfs 根节点：/sys/kernel/debug/yat_casched（未编译 DEBUG_FS 时为 NULL） */
+static struct dentry *yat_debugfs_root;
+/*
+ * 计数器增量。
+ *
+ * 用 this_cpu_inc()/this_cpu_add() 而不是 atomic_t：
+ *   - 这些计数器在热点路径上，atomic_t 会引入 lock 前缀，跨核争用严重；
+ *   - 计数器只用于观测，求和时允许短暂不一致（最多丢掉一次正在进行的加法）。
+ * 注意 this_cpu_* 隐含关抢占（单指令 RMW），因此在持有 rq_lock 的上下文里
+ * 调用是安全的。
+ */
+#define YAT_STAT_INC(field)	this_cpu_inc(yat_stats.field)
+#define YAT_STAT_ADD(field, v)	this_cpu_add(yat_stats.field, (v))
+/*
+ * 汇总所有 CPU 上的某个计数器。
+ *
+ * 用 offsetof + for_each_possible_cpu 而不是为每个字段写一遍循环：
+ * 7 个计数器写 7 遍样板代码既易错又难维护，而 struct 布局是编译期常量，
+ * 按偏移访问完全类型安全（字段都是 u64，对齐一致）。
+ */
+static u64 yat_stats_sum(size_t offset)
+{
+	u64 total = 0;
+	int cpu;
+	for_each_possible_cpu(cpu)
+		total += *(u64 *)((char *)per_cpu_ptr(&yat_stats, cpu) + offset);
+	return total;
+}
+#define YAT_STAT_SUM(field)	\
+	yat_stats_sum(offsetof(struct yat_casched_stats, field))
+/*
+ * debugfs: /sys/kernel/debug/yat_casched/stats
+ *
+ * 输出的是**累计量**，不是瞬时值。要观察时序请开 tracepoint；
+ * 这里回答的是"调度器到底跑了多少轮、分配成功多少次、跳过多少次"。
+ * 特别是 balance_skips / balance_runs 的比值，直接反映全局调度的争用程度 ——
+\end{Verbatim}
+\end{yatpage}
+\newpage
+\begin{yatpage}
+\begin{Verbatim}[fontsize=\fontsize{8.2}{9.8}\selectfont]
+ * 如果 skips 远大于 runs，说明 trylock 单飞设计下只有一颗核在干活，
+ * 后续需要把 yat_balance_lock 换成更细粒度的分片锁。
+ */
+static int yat_stats_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "balance_runs      %llu\n", YAT_STAT_SUM(balance_runs));
+	seq_printf(m, "balance_skips     %llu\n", YAT_STAT_SUM(balance_skips));
+	seq_printf(m, "balance_noop      %llu\n", YAT_STAT_SUM(balance_noop));
+	seq_printf(m, "pool_scans        %llu\n", YAT_STAT_SUM(pool_scans));
+	seq_printf(m, "pool_scan_skips   %llu\n", YAT_STAT_SUM(pool_scan_skips));
+	seq_printf(m, "jobs_placed       %llu\n", YAT_STAT_SUM(jobs_placed));
+	seq_printf(m, "jobs_nocore       %llu\n", YAT_STAT_SUM(jobs_nocore));
+	seq_printf(m, "history_records   %llu\n", YAT_STAT_SUM(history_records));
+	seq_printf(m, "accel_inserts     %llu\n", YAT_STAT_SUM(accel_inserts));
+	seq_printf(m, "accel_dup         %llu\n", YAT_STAT_SUM(accel_dup));
+	/*
+	 * select_task_rq 链路（A8）。读法：
+	 *   select_calls == 0                → 核心调度器压根没调用回调，
+	 *                                      检查 nr_cpus_allowed 或 ttwu 快路径；
+	 *   select_calls > 0, select_decided == 0
+	 *                                    → 被调用了，但每次都在节流/无核处退出，
+	 *                                      看 sticky_* / nocore 判断原因；
+	 *   select_decided > 0 但 jobs_placed == 0
+	 *                                    → 计数器放置有误，属于内核 bug。
+	 */
+	seq_printf(m, "select_calls      %llu\n", YAT_STAT_SUM(select_calls));
+	seq_printf(m, "select_not_ttwu   %llu\n", YAT_STAT_SUM(select_not_ttwu));
+	seq_printf(m, "select_nojob      %llu\n", YAT_STAT_SUM(select_nojob));
+	seq_printf(m, "select_sticky_idle %llu\n", YAT_STAT_SUM(select_sticky_idle));
+	seq_printf(m, "select_sticky_intv %llu\n", YAT_STAT_SUM(select_sticky_interval));
+	seq_printf(m, "select_nocore     %llu\n", YAT_STAT_SUM(select_nocore));
+	seq_printf(m, "select_decided    %llu\n", YAT_STAT_SUM(select_decided));
+	seq_printf(m, "enq_calls         %llu\n", YAT_STAT_SUM(enq_calls));
+	seq_printf(m, "enq_cpus_allowed  %llu\n", YAT_STAT_SUM(enq_cpus_allowed_sum));
+	seq_printf(m, "ttwu_state_bail   %llu\n", YAT_STAT_SUM(ttwu_state_bail));
+	seq_printf(m, "ttwu_runnable     %llu\n", YAT_STAT_SUM(ttwu_runnable));
+	seq_printf(m, "ttwu_wakelist     %llu\n", YAT_STAT_SUM(ttwu_wakelist));
+	seq_printf(m, "ttwu_ok           %llu\n", YAT_STAT_SUM(ttwu_ok));
+	seq_printf(m, "pick_calls        %llu\n", YAT_STAT_SUM(pick_calls));
+	seq_printf(m, "pick_null_desync  %llu\n", YAT_STAT_SUM(pick_null_desync));
+	seq_printf(m, "deq_calls         %llu\n", YAT_STAT_SUM(deq_calls));
+	seq_printf(m, "deq_sleep         %llu\n", YAT_STAT_SUM(deq_sleep));
+	seq_printf(m, "place_hit         %llu\n", YAT_STAT_SUM(place_hit));
+	seq_printf(m, "place_miss        %llu\n", YAT_STAT_SUM(place_miss));
+	seq_printf(m, "place_pending     %llu\n", YAT_STAT_SUM(place_pending));
+	seq_printf(m, "nr_cpu_ids        %u\n", nr_cpu_ids);
+	return 0;
+}
+/*
+ * try_to_wake_up() 的出口探针。
+ *
+ * 定义在这里而不是 core.c，是为了让计数器与 debugfs 展示共用同一份
+ * per-CPU 存储；core.c 只负责在四个出口各调用一次。
+ *
+ * 只有目标任务是 yat 类的唤醒才计数：否则 guest 里 init/busybox 等
+\end{Verbatim}
+\end{yatpage}
+\newpage
+\begin{yatpage}
+\begin{Verbatim}[fontsize=\fontsize{8.2}{9.8}\selectfont]
+ * CFS 任务的唤醒会把计数冲到几十万，yat 的那几次被完全淹没。
+ */
+void yat_probe_ttwu(struct task_struct *p, int kind)
+{
+	if (READ_ONCE(p->sched_class) != &yat_casched_sched_class)
+		return;
+	switch (kind) {
+	case YAT_TTWU_STATE_BAIL:
+		YAT_STAT_INC(ttwu_state_bail);
+		break;
+	case YAT_TTWU_RUNNABLE:
+		YAT_STAT_INC(ttwu_runnable);
+		break;
+	case YAT_TTWU_WAKELIST:
+		YAT_STAT_INC(ttwu_wakelist);
+		break;
+	case YAT_TTWU_OK:
+		YAT_STAT_INC(ttwu_ok);
+		break;
+	default:
+		break;
+	}
+}
+static int yat_stats_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, yat_stats_show, NULL);
+}
+static const struct file_operations yat_stats_fops = {
+	.open		= yat_stats_open,
+	.read		= seq_read,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+};
+/*
+ * debugfs: /sys/kernel/debug/yat_casched/ready_pool
+ *
+ * 就绪池当前快照。持 pool->lock 读取，所以看到的是某一瞬间的一致视图。
+ * 每行一个作业，按池内顺序（即调度顺序）打印。
+ *
+ * 必须用 spin_lock_irqsave()，不能用 spin_lock()：
+ *   pool->lock 在调度热路径里总是在**关中断**状态下被获取的
+ *   （balance_yat_casched() 运行在 rq_lock 内，而 rq_lock 是 irq-safe 的），
+ *   因此 pool->lock 在 lockdep 眼里是 HARDIRQ-safe 锁。debugfs 的 read()
+ *   跑在普通进程上下文（中断是开的），若这里只 spin_lock() 而不关中断，
+ *   则「进程持有 pool->lock」+「中断里 scheduler_tick() 取 rq->lock 再取
+ *   pool->lock」就构成真实的 ABBA 死锁。实跑 lockdep 已报出
+ *   "possible irq lock inversion dependency detected"。
+ */
+static int yat_ready_pool_show(struct seq_file *m, void *v)
+{
+	struct yat_ready_job_pool *pool = READ_ONCE(global_ready_pool);
+	struct yat_job *job;
+	unsigned long flags;
+	if (!pool) {
+		seq_puts(m, "ready pool 尚未初始化\n");
+\end{Verbatim}
+\end{yatpage}
+\newpage
+\begin{yatpage}
+\begin{Verbatim}[fontsize=\fontsize{8.2}{9.8}\selectfont]
+		return 0;
+	}
+	spin_lock_irqsave(&pool->lock, flags);
+	seq_printf(m, "nr_jobs %d\n", pool->nr_jobs);
+	seq_puts(m, "pid\tjob_id\tprio\tdag_prio\twcet\tstate\n");
+	list_for_each_entry(job, &pool->head, ready_list) {
+		seq_printf(m, "%d\t%d\t%d\t%d\t%llu\t%d\n",
+			   job->task ? job->task->pid : 0,
+			   job->job_id, job->job_priority,
+			   job->dag ? job->dag->priority : 0,
+			   (unsigned long long)job->wcet,
+			   job->state);
+	}
+	spin_unlock_irqrestore(&pool->lock, flags);
+	return 0;
+}
+static int yat_ready_pool_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, yat_ready_pool_show, NULL);
+}
+static const struct file_operations yat_ready_pool_fops = {
+	.open		= yat_ready_pool_open,
+	.read		= seq_read,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+};
+/*
+ * debugfs: /sys/kernel/debug/yat_casched/dags
+ *
+ * 活动 DAG 与作业状态分布。用来看"作业卡在哪一层"：
+ * waiting 数远大于 ready 通常意味着依赖图没被正确唤醒
+ * （yat_job_complete() 传播失败），而不是核心不够。
+ */
+static int yat_dags_show(struct seq_file *m, void *v)
+{
+	struct yat_dag_task *dag;
+	struct yat_job *job;
+	unsigned long flags;
+	seq_puts(m, "dag_id\tprio\ttotal\tcompleted\twaiting\tready\trunning\n");
+	/* 同上：这两把锁在调度路径里都是关中断持有的，读取端必须一起关中断。 */
+	spin_lock_irqsave(&global_dag_lock, flags);
+	list_for_each_entry(dag, &global_dag_list, dag_list) {
+		int waiting = 0, ready = 0, running = 0;
+		/*
+		 * 嵌套子类：本函数持有 global_dag_lock 再取 dag->lock，
+		 * 而调度路径里也有同样的顺序（如 yat_update_ready_pool()），
+		 * 用 _nested(1) 明确告诉 lockdep 这是预期的层次，
+		 * 避免把合法的「父 → 子」关系误判为环。
+		 */
+		spin_lock_nested(&dag->lock, 1);
+		list_for_each_entry(job, &dag->jobs, job_list) {
+			switch (job->state) {
+			case YAT_JOB_WAITING:	waiting++;	break;
+			case YAT_JOB_READY:	ready++;	break;
+			case YAT_JOB_RUNNING:	running++;	break;
+\end{Verbatim}
+\end{yatpage}
+\newpage
+\begin{yatpage}
+\begin{Verbatim}[fontsize=\fontsize{8.2}{9.8}\selectfont]
+			default:				break;
+			}
+		}
+		seq_printf(m, "%d\t%d\t%d\t%d\t\t%d\t%d\t%d\n",
+			   dag->dag_id, dag->priority, dag->total_jobs,
+			   dag->completed_jobs, waiting, ready, running);
+		spin_unlock(&dag->lock);
+	}
+	spin_unlock_irqrestore(&global_dag_lock, flags);
+	return 0;
+}
+static int yat_dags_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, yat_dags_show, NULL);
+}
+static const struct file_operations yat_dags_fops = {
+	.open		= yat_dags_open,
+	.read		= seq_read,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+};
+/*
+ * debugfs: /sys/kernel/debug/yat_casched/placements
+ *
+ * 「决策 vs 实际」对照表 —— assigned_cpu 这个字段存在的意义就在这里。
+ *
+ *   assigned : AJLR 认为该作业应该在哪颗核上运行（YAT_INVALID_CORE 表示
+ *              尚未决策，通常是刚从 fork 出来、还没经历过一次唤醒）；
+ *   actual   : 该作业当前实际被绑定的核（task_cpu()）；
+ *   verdict  : ok      两者一致
+ *              pending 尚未决策
+ *              denied  不一致 —— 说明 is_cpu_allowed()/亲和性掩码否决了
+ *                      AJLR 的决策，或任务在决策后又被 migrate 走了
+ *
+ * denied 占比是衡量「算法决策真正生效程度」的唯一直接指标。若该比例
+ * 长期偏高，说明瓶颈不在 AJLR 本身，而在 cpuset/亲和性配置。
+ *
+ * 一致性说明：遍历期间持有 global_dag_lock 与 dag->lock，
+ * 而 yat_destroy_job() 也要先取 dag->lock 才会摘链并 kfree，
+ * 因此只要作业还挂在 dag->jobs 上，其内存就是有效的。
+ */
+static int yat_placements_show(struct seq_file *m, void *v)
+{
+	struct yat_dag_task *dag;
+	struct yat_job *job;
+	unsigned long flags;
+	int ok = 0, pending = 0, denied = 0;
+	seq_puts(m, "job_id\tpid\tprio\tassigned\tactual\tverdict\n");
+	spin_lock_irqsave(&global_dag_lock, flags);
+	list_for_each_entry(dag, &global_dag_list, dag_list) {
+		spin_lock_nested(&dag->lock, 1);
+		list_for_each_entry(job, &dag->jobs, job_list) {
+			int assigned = READ_ONCE(job->assigned_cpu);
+			int actual = job->task ? task_cpu(job->task) : -1;
+			const char *verdict;
+\end{Verbatim}
+\end{yatpage}
+\newpage
+\begin{yatpage}
+\begin{Verbatim}[fontsize=\fontsize{8.2}{9.8}\selectfont]
+			if (assigned == YAT_INVALID_CORE) {
+				verdict = "pending";
+				pending++;
+			} else if (assigned == actual) {
+				verdict = "ok";
+				ok++;
+			} else {
+				verdict = "denied";
+				denied++;
+			}
+			seq_printf(m, "%d\t%d\t%d\t%d\t%d\t%s\n",
+				   job->job_id,
+				   job->task ? job->task->pid : -1,
+				   job->job_priority, assigned, actual, verdict);
+		}
+		spin_unlock(&dag->lock);
+	}
+	spin_unlock_irqrestore(&global_dag_lock, flags);
+	seq_printf(m, "\nsummary: ok=%d denied=%d pending=%d\n",
+		   ok, denied, pending);
+	return 0;
+}
+static int yat_placements_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, yat_placements_show, NULL);
+}
+static const struct file_operations yat_placements_fops = {
+	.open		= yat_placements_open,
+	.read		= seq_read,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+};
+/*
+ * 创建 debugfs 节点。失败不影响调度功能，只是少了一个观测入口。
+ *
+ * 返回 int 而不是 void：initcall_t 的类型是 int (*)(void)，用
+ * late_initcall() 注册的函数必须严格匹配，否则 ____define_initcall()
+ * 里的 static_assert(__same_type(initcall_t, &fn)) 会直接编译失败。
+ * 返回值恒为 0 —— 节点创建失败不需要阻止内核继续启动。
+ */
+static int __init yat_debugfs_init(void)
+{
+	yat_debugfs_root = debugfs_create_dir("yat_casched", NULL);
+	if (!yat_debugfs_root)
+		return 0;
+	debugfs_create_file("stats", 0444, yat_debugfs_root, NULL,
+			    &yat_stats_fops);
+	debugfs_create_file("ready_pool", 0444, yat_debugfs_root, NULL,
+			    &yat_ready_pool_fops);
+	debugfs_create_file("dags", 0444, yat_debugfs_root, NULL,
+			    &yat_dags_fops);
+	debugfs_create_file("placements", 0444, yat_debugfs_root, NULL,
+			    &yat_placements_fops);
+	return 0;
+}
+\end{Verbatim}
+\end{yatpage}
+\newpage
+\begin{yatpage}
+\begin{Verbatim}[fontsize=\fontsize{8.2}{9.8}\selectfont]
+/*
+ * 必须用 late_initcall 而不是在 sched_init() 里创建节点：
+ * sched_init() 跑在 start_kernel() 的早期，此时 debugfs 尚未挂载
+ * （debugfs_init() 是 core_initcall，且 root 目录要到 vfs_caches_init()
+ * 之后才可用），debugfs_create_dir() 会直接返回 -ENODEV 或 NULL。
+ *
+ * late_initcall 阶段用户态还没起，但内核初始化已完成，debugfs 可写。
+ * 创建失败（CONFIG_DEBUG_FS=n 时 debugfs_create_dir() 返回 ERR_PTR 兼容值）
+ * 不影响任何调度路径 —— 所有统计写入都是 this_cpu_inc()，与节点是否存在无关。
+ */
+late_initcall(yat_debugfs_init);
+/*
+ * AJLR核心数据结构管理函数
+ */
+/* 前置声明 */
+static void yat_ajlr_enqueue_task(struct rq *rq, struct task_struct *p, int flags);
+static void yat_ajlr_dequeue_task(struct rq *rq, struct task_struct *p, int flags);
+/*
+ * yat_get_default_dag() 定义在文件末尾（与 yat_ajlr_enqueue_task 相邻，
+ * 便于读者对照"默认 DAG 从哪来"）。而 select_task_rq() 的选核路径在
+ * 文件中部就要用到它，因此这里补一个前置声明。
+ */
+static struct yat_dag_task *yat_get_default_dag(void);
+struct yat_job *yat_create_job_for_task(struct task_struct *task, int job_priority, u64 wc
+    et, struct yat_dag_task *dag);
+void yat_complete_task_job(struct task_struct *task);
+void yat_create_test_dag(void);
+/* Ready Pool 函数声明 */
+static int yat_ready_pool_init(struct yat_ready_job_pool *pool);
+static void yat_ready_pool_destroy(struct yat_ready_job_pool *pool);
+static int yat_ready_pool_enqueue(struct yat_ready_job_pool *pool, struct yat_job *job);
+static struct yat_job *yat_ready_pool_dequeue(struct yat_ready_job_pool *pool);
+static void yat_ready_pool_remove(struct yat_ready_job_pool *pool, struct yat_job *job);
+/* History 函数声明 */
+static void yat_init_history_tables(struct yat_cpu_history_table *tables);
+static void yat_destroy_history_tables(struct yat_cpu_history_table *tables) __maybe_unuse
+    d;
+static int yat_add_history_record(int cpu, int job_id, u64 timestamp, u64 exec_time);
+static u64 yat_get_task_last_timestamp(int cpu, int job_id);
+static u64 yat_sum_exec_time_since(int cpu, u64 start_ts, u64 end_ts);
+/* 初始化就绪作业池 */
+static int yat_ready_pool_init(struct yat_ready_job_pool *pool)
+{
+    if (!pool)
+        return -EINVAL;
+    INIT_LIST_HEAD(&pool->head);
+    spin_lock_init(&pool->lock);
+    pool->nr_jobs = 0;
+    return 0;
+}
+/* 销毁就绪作业池（当前仅在模块级清理路径使用，保留以免随进程退出泄漏） */
+static void __maybe_unused yat_ready_pool_destroy(struct yat_ready_job_pool *pool)
+{
+    struct yat_job *job, *tmp;
+    if (!pool)
+\end{Verbatim}
+\end{yatpage}
+\newpage
+\begin{yatpage}
+\begin{Verbatim}[fontsize=\fontsize{8.2}{9.8}\selectfont]
+        return;
+    spin_lock(&pool->lock);
+    list_for_each_entry_safe(job, tmp, &pool->head, ready_list) {
+        list_del(&job->ready_list);
+    }
+    pool->nr_jobs = 0;
+    spin_unlock(&pool->lock);
+}
+/* 就绪作业池入队（按优先级排序） */
+static int yat_ready_pool_enqueue(struct yat_ready_job_pool *pool, struct yat_job *job)
+{
+    struct yat_job *existing_job;
+    struct list_head *pos;
+    unsigned int nr_jobs;
+    if (!pool || !job)
+        return -EINVAL;
+    spin_lock(&pool->lock);
+    /* 按优先级排序插入：DAG优先级 > 作业优先级 > WCET */
+    list_for_each(pos, &pool->head) {
+        existing_job = list_entry(pos, struct yat_job, ready_list);
+        /* 主键：DAG优先级 */
+        if (job->dag->priority > existing_job->dag->priority)
+            break;
+        if (job->dag->priority < existing_job->dag->priority)
+            continue;
+        /* 次键：作业优先级 */
+        if (job->job_priority > existing_job->job_priority)
+            break;
+        if (job->job_priority < existing_job->job_priority)
+            continue;
+        /* 三键：WCET（大的在前） */
+        if (job->wcet > existing_job->wcet)
+            break;
+    }
+    list_add_tail(&job->ready_list, pos);
+    job->state = YAT_JOB_READY;
+    pool->nr_jobs++;
+    nr_jobs = pool->nr_jobs;
+    spin_unlock(&pool->lock);
+    /*
+     * tracepoint 放在锁外：trace 事件内部要取 ring buffer 的每 CPU 锁，
+     * 虽然不阻塞，但保持「临界区内只碰数据结构」的惯例能让 lockdep 的
+     * 持有链更易读，也避免 ring buffer 锁与 pool->lock 形成嵌套。
+     * 静态分支未开启时这里只有一条 nop，热路径代价可忽略。
+     */
+    trace_yat_casched_enqueue(job->task ? job->task->pid : 0,
+                              job->job_id, job->job_priority, nr_jobs);
+    return 0;
+}
+/* 就绪作业池出队（取队头） */
+static struct yat_job *yat_ready_pool_dequeue(struct yat_ready_job_pool *pool)
+{
+    struct yat_job *job = NULL;
+    unsigned int nr_jobs = 0;
+    if (!pool)
+\end{Verbatim}
+\end{yatpage}
+\newpage
+\begin{yatpage}
+\begin{Verbatim}[fontsize=\fontsize{8.2}{9.8}\selectfont]
+        return NULL;
+    spin_lock(&pool->lock);
+    if (!list_empty(&pool->head)) {
+        job = list_first_entry(&pool->head, struct yat_job, ready_list);
+        list_del_init(&job->ready_list);
+        job->state = YAT_JOB_RUNNING;
+        pool->nr_jobs--;
+        nr_jobs = pool->nr_jobs;
+    }
+    spin_unlock(&pool->lock);
+    if (job)
+        trace_yat_casched_dequeue(job->task ? job->task->pid : 0,
+                                  job->job_id, nr_jobs);
+    return job;
+}
+/*
+ * 原 yat_ready_pool_peek() 已删除。
+ *
+ * "peek 之后再做 dequeue" 本身就是 TOCTOU：两者之间池头可能被换掉，
+ * 于是 dequeue 弹出的作业和基于 peek 结果算出的 best_core 对不上
+ * （详见 yat_schedule_ajlr() 的注释）。现在的调用点是原子 dequeue，
+ * 没有任何地方需要非破坏性查看，留着只会诱使后来者重新引入该 bug。
+ */
+/* 从就绪池移除指定作业 */
+static void yat_ready_pool_remove(struct yat_ready_job_pool *pool, struct yat_job *job)
+{
+    if (!pool || !job)
+        return;
+    spin_lock(&pool->lock);
+    if (!list_empty(&job->ready_list)) {
+        list_del_init(&job->ready_list);
+        pool->nr_jobs--;
+    }
+    spin_unlock(&pool->lock);
+}
+/*
+ * DAG和作业管理函数
+ */
+/*
+ * 创建 DAG。
+ *
+ * gfp 必须由调用者显式给出：本函数既能从进程上下文调用（如
+ * yat_create_test_dag()，可用 GFP_KERNEL），也可能从
+ * yat_ajlr_enqueue_task() 这条「持 rq_lock、可能关中断」的原子路径
+ * 首次触达（那里只能 GFP_ATOMIC）。原实现硬编码 GFP_KERNEL，
+ * 在原子上下文里会触发 "sleeping function called from invalid context"。
+ *
+ * dag_id 分配用 atomic_inc_return()：原来 `next_dag_id++` 是
+ * 无保护的 read-modify-write，多 CPU 同时创建 DAG 会拿到重复 ID，
+ * 而 dag_id 是调试/统计路径里识别 DAG 的唯一键。
+ */
+static struct yat_dag_task *__yat_create_dag(int dag_id, int dag_priority, gfp_t gfp)
+{
+    struct yat_dag_task *dag;
+    dag = kmalloc(sizeof(*dag), gfp);
+\end{Verbatim}
+\end{yatpage}
+\newpage
+\begin{yatpage}
+\begin{Verbatim}[fontsize=\fontsize{8.2}{9.8}\selectfont]
+    if (!dag)
+        return NULL;
+    dag->dag_id = (dag_id <= 0) ? atomic_inc_return(&next_dag_id) : dag_id;
+    dag->priority = dag_priority;
+    dag->total_jobs = 0;
+    dag->completed_jobs = 0;
+    INIT_LIST_HEAD(&dag->dag_list);
+    INIT_LIST_HEAD(&dag->jobs);
+    spin_lock_init(&dag->lock);
+    spin_lock(&global_dag_lock);
+    list_add_tail(&dag->dag_list, &global_dag_list);
+    spin_unlock(&global_dag_lock);
+    return dag;
+}
+/* 创建DAG（进程上下文默认入口） */
+struct yat_dag_task *yat_create_dag(int dag_id, int dag_priority)
+{
+    return __yat_create_dag(dag_id, dag_priority, GFP_KERNEL);
+}
+/*
+ * 销毁DAG。
+ *
+ * 两处必须小心：
+ *
+ * 1. 作业可能同时挂在两处：dag->jobs 与全局就绪池的 pool->head。
+ *    原实现只摘 dag->jobs 就 kfree，若该作业仍在就绪池里，随后的
+ *    yat_ready_pool_peek()/dequeue() 会对已释放内存做 list 操作 ——
+ *    use-after-free。因此必须先把作业从就绪池摘除。
+ *
+ * 2. kfree 不能在自旋锁内调用（kfree 可能进入回收器并抢其他锁）。
+ *    这里摘链与释放分离：临界区里只 list_del，解锁后统一 kfree。
+ *    借用 job->ready_list 串一个栈上的临时链表来完成。
+ */
+void yat_destroy_dag(struct yat_dag_task *dag)
+{
+    struct yat_job *job, *tmp;
+    LIST_HEAD(doomed);
+    if (!dag)
+        return;
+    spin_lock(&global_dag_lock);
+    list_del_init(&dag->dag_list);
+    spin_unlock(&global_dag_lock);
+    /*
+     * 先从就绪池摘除：yat_ready_pool_remove() 只碰 job->ready_list 和
+     * pool->lock，与 dag->lock 无关系，所以在 dag->lock 之外调用。
+     */
+    if (global_ready_pool) {
+        spin_lock(&dag->lock);
+        list_for_each_entry(job, &dag->jobs, job_list)
+            yat_ready_pool_remove(global_ready_pool, job);
+        spin_unlock(&dag->lock);
+    }
+    /* 摘 dag->jobs，挂到临时链表上，锁外释放 */
+    spin_lock(&dag->lock);
+    list_for_each_entry_safe(job, tmp, &dag->jobs, job_list) {
+\end{Verbatim}
+\end{yatpage}
+\newpage
+\begin{yatpage}
+\begin{Verbatim}[fontsize=\fontsize{8.2}{9.8}\selectfont]
+        list_del_init(&job->job_list);
+        list_add_tail(&job->ready_list, &doomed);
+    }
+    spin_unlock(&dag->lock);
+    list_for_each_entry_safe(job, tmp, &doomed, ready_list) {
+        list_del_init(&job->ready_list);
+        kfree(job);
+    }
+    kfree(dag);
+}
+/*
+ * 创建作业。gfp 的约束同 __yat_create_dag()：可能从原子上下文到达。
+ */
+static struct yat_job *__yat_create_job(int job_id, int job_priority, u64 wcet,
+                                       struct yat_dag_task *dag, gfp_t gfp)
+{
+    struct yat_job *job;
+    if (!dag)
+        return NULL;
+    job = kmalloc(sizeof(*job), gfp);
+    if (!job)
+        return NULL;
+    job->job_id = (job_id <= 0) ? atomic_inc_return(&next_job_id) : job_id;
+    job->job_priority = job_priority;
+    job->wcet = wcet;
+    job->dag = dag;
+    job->task = NULL;
+    job->state = YAT_JOB_WAITING;
+    job->pending_predecessors = 0;
+    job->assigned_cpu = YAT_INVALID_CORE;
+    job->last_decision_ns = 0;
+    INIT_LIST_HEAD(&job->job_list);
+    INIT_LIST_HEAD(&job->ready_list);
+    INIT_LIST_HEAD(&job->predecessors);
+    INIT_LIST_HEAD(&job->successors);
+    spin_lock(&dag->lock);
+    list_add_tail(&job->job_list, &dag->jobs);
+    dag->total_jobs++;
+    spin_unlock(&dag->lock);
+    /* 无前驱的作业创建即就绪，推进代际让 balance 扫到它 */
+    if (job->pending_predecessors == 0)
+        atomic_inc(&yat_ready_gen);
+    return job;
+}
+/* 创建作业（进程上下文默认入口） */
+struct yat_job *yat_create_job(int job_id, int job_priority, u64 wcet, struct yat_dag_task
+     *dag)
+{
+    return __yat_create_job(job_id, job_priority, wcet, dag, GFP_KERNEL);
+}
+/*
+ * 销毁作业。
+ *
+ * 关键点：必须先把作业从**全局就绪池**摘下来，再摘 DAG 链表，最后才 kfree。
+ * 原实现只做了 list_del(&job->job_list) 就 kfree，如果这个作业此刻正躺在
+\end{Verbatim}
+\end{yatpage}
+\newpage
+\begin{yatpage}
+\begin{Verbatim}[fontsize=\fontsize{8.2}{9.8}\selectfont]
+ * yat_ready_pool 里，kfree 之后 pool->head 仍指向已释放内存 —— 下一次
+ * yat_ready_pool_dequeue() 就是 use-after-free（KASAN 必报）。
+ *
+ * 顺序也重要：先 pool 再 dag->lock，与
+ * global_dag_lock -> dag->lock -> pool->lock 的既有方向不矛盾
+ * （这里不持 global_dag_lock，只取 pool->lock，两把锁不嵌套）。
+ */
+void yat_destroy_job(struct yat_job *job)
+{
+    if (!job)
+        return;
+    /* 1. 从全局就绪池摘除（若在池中）。job->ready_list 为空时该函数是 no-op */
+    if (global_ready_pool)
+        yat_ready_pool_remove(global_ready_pool, job);
+    /* 2. 从所属 DAG 的作业链表摘除 */
+    if (job->dag) {
+        spin_lock(&job->dag->lock);
+        if (!list_empty(&job->job_list))
+            list_del_init(&job->job_list);
+        if (job->dag->total_jobs > 0)
+            job->dag->total_jobs--;
+        spin_unlock(&job->dag->lock);
+    }
+    kfree(job);
+}
+/*
+ * 建立依赖关系：predecessor 完成之前，job 不可进入就绪池。
+ *
+ * 原实现只做 job->pending_predecessors++，既没有把 job 挂到 predecessor
+ * 的后继链表，也没有把 predecessor 挂到 job 的前驱链表 —— 于是
+ * yat_job_complete() 无从知道该唤醒谁，整条 DAG 依赖链永远停在
+ * pending_predecessors>0 的状态，作业永远不会就绪。
+ */
+void yat_job_add_dependency(struct yat_job *job, struct yat_job *predecessor)
+{
+    if (!job || !predecessor || job == predecessor)
+        return;
+    /* 依赖边写入需要同时改两端，用 job 自己的 DAG 锁串行化 */
+    if (job->dag)
+        spin_lock(&job->dag->lock);
+    else if (predecessor->dag)
+        spin_lock(&predecessor->dag->lock);
+    list_add_tail(&job->predecessors, &predecessor->successors);
+    job->pending_predecessors++;
+    if (job->dag)
+        spin_unlock(&job->dag->lock);
+    else if (predecessor->dag)
+        spin_unlock(&predecessor->dag->lock);
+}
+/*
+ * 作业完成处理。
+ *
+ * 语义：把自己标记完成，然后逐个通知后继 —— 每个后继的
+ * pending_predecessors 减一，减到 0 的就可以被
+ * yat_update_ready_pool() 收进就绪池。这不是"唤醒"，因为 AJLR 的就绪
+\end{Verbatim}
+\end{yatpage}
+\newpage
+\begin{yatpage}
+\begin{Verbatim}[fontsize=\fontsize{8.2}{9.8}\selectfont]
+ * 判定完全由 ready_pool + pending_predecessors 驱动，没有等待队列。
+ */
+void yat_job_complete(struct yat_job *job)
+{
+    struct yat_job *succ, *tmp;
+    struct yat_dag_task *dag;
+    LIST_HEAD(propagate);
+    if (!job)
+        return;
+    dag = job->dag;
+    /* 1. 在锁内完成状态迁移 + 把后继链表整段搬出来 */
+    if (dag)
+        spin_lock(&dag->lock);
+    if (job->state == YAT_JOB_COMPLETED)
+        goto out_unlock;   /* 幂等：重复完成不重复递减后继计数 */
+    job->state = YAT_JOB_COMPLETED;
+    if (dag && dag->completed_jobs < dag->total_jobs)
+        dag->completed_jobs++;
+    list_splice_init(&job->successors, &propagate);
+    if (dag)
+        spin_unlock(&dag->lock);
+    /* 2. 锁外递减后继计数（后面还会取 dag->lock，避免自我嵌套） */
+    list_for_each_entry_safe(succ, tmp, &propagate, predecessors) {
+        list_del_init(&succ->predecessors);
+        if (succ->pending_predecessors > 0)
+            succ->pending_predecessors--;
+        /* 最后一个前驱完成 → 该作业就绪，推进代际 */
+        if (succ->pending_predecessors == 0)
+            atomic_inc(&yat_ready_gen);
+    }
+    return;
+out_unlock:
+    if (dag)
+        spin_unlock(&dag->lock);
+}
+/*
+ * 历史表管理函数 - 基于双向链表的新实现
+ */
+/* 初始化历史表 */
+static void yat_init_history_tables(struct yat_cpu_history_table *tables)
+{
+    int cpu;
+    if (!tables)
+        return;
+    for (cpu = 0; cpu < NR_CPUS; cpu++) {
+        INIT_LIST_HEAD(&tables[cpu].time_list);
+        spin_lock_init(&tables[cpu].lock);
+        tables[cpu].last_cleanup_time = jiffies;
+        tables[cpu].nr_records = 0;
+    }
+}
+/*
+ * 摘掉整条历史记录链并返回，调用者必须在**锁外**调用 kfree。
+ * 这是把「摘链」与「释放」分离的标准做法：kfree 会进入 slab 回收器，
+ * 可能抢 zone lock / lru_lock，在自旋锁内调用是上下文违规。
+\end{Verbatim}
+\end{yatpage}
+\newpage
+\begin{yatpage}
+\begin{Verbatim}[fontsize=\fontsize{8.2}{9.8}\selectfont]
+ */
+static void yat_detach_history_records(struct yat_cpu_history_table *tbl,
+				      struct list_head *out)
+{
+	INIT_LIST_HEAD(out);
+	spin_lock(&tbl->lock);
+	list_splice_init(&tbl->time_list, out);
+	tbl->nr_records = 0;
+	spin_unlock(&tbl->lock);
+}
+/* 销毁历史表 */
+static void yat_destroy_history_tables(struct yat_cpu_history_table *tables)
+{
+    struct yat_history_record *rec, *tmp;
+    LIST_HEAD(doomed);
+    int cpu;
+    if (!tables)
+        return;
+    for (cpu = 0; cpu < NR_CPUS; cpu++) {
+        yat_detach_history_records(&tables[cpu], &doomed);
+        list_for_each_entry_safe(rec, tmp, &doomed, list) {
+            list_del(&rec->list);
+            kfree(rec);
+        }
+    }
+}
+/*
+ * 添加历史记录。
+ *
+ * 上下文：可能从 balance_yat_casched()（持 rq_lock，可能关中断）以及
+ * pick_next_task/put_prev_task（持 rq_lock）调用，所以分配必须是
+ * GFP_ATOMIC 且不能失败后重试。
+ *
+ * 限流：链表长度超过 YAT_HISTORY_MAX_RECORDS 时，在**同一次插入**里
+ * 顺手摘掉最旧的一批（链表按时间戳递增，头部最旧）。裁剪部分同样
+ * 在锁外 kfree。
+ */
+static int yat_add_history_record(int cpu, int job_id, u64 timestamp, u64 exec_time)
+{
+    struct yat_history_record *rec, *old, *tmp;
+    struct yat_cpu_history_table *tbl;
+    LIST_HEAD(expired);
+    bool need_trim = false;
+    if (cpu < 0 || cpu >= NR_CPUS)
+        return -EINVAL;
+    tbl = &global_history_tables[cpu];
+    rec = kmalloc(sizeof(*rec), GFP_ATOMIC);
+    if (!rec)
+        return -ENOMEM;
+    rec->job_id = job_id;
+    rec->timestamp = timestamp;
+    rec->exec_time = exec_time;
+    spin_lock(&tbl->lock);
+    /* 直接插入链表尾部（时间戳递增） */
+    list_add_tail(&rec->list, &tbl->time_list);
+\end{Verbatim}
+\end{yatpage}
+\newpage
+\begin{yatpage}
+\begin{Verbatim}[fontsize=\fontsize{8.2}{9.8}\selectfont]
+    tbl->nr_records++;
+    if (tbl->nr_records > YAT_HISTORY_MAX_RECORDS) {
+        /*
+         * 一次裁掉 1/4，避免每次插入都裁一条导致锁内工作变成常量开销，
+         * 也避免裁剪频率随负载线性上升。
+         */
+        unsigned int target = YAT_HISTORY_MAX_RECORDS * 3 / 4;
+        unsigned int excess = tbl->nr_records - target;
+        list_for_each_entry_safe(old, tmp, &tbl->time_list, list) {
+            if (!excess)
+                break;
+            list_move_tail(&old->list, &expired);
+            tbl->nr_records--;
+            excess--;
+        }
+        need_trim = true;
+    }
+    spin_unlock(&tbl->lock);
+    if (need_trim) {
+        list_for_each_entry_safe(old, tmp, &expired, list) {
+            list_del(&old->list);
+            kfree(old);
+        }
+    }
+    /*
+     * 统计 + tracepoint 都放在锁外：本函数在持 rq_lock 的调度回调里运行，
+     * 越短地持有 tbl->lock 越好；trace 事件的写入也不该被 tbl->lock 串行化，
+     * 否则每个 CPU 的历史表锁会变成全局 trace 吞吐的瓶颈。
+     */
+    YAT_STAT_INC(history_records);
+    trace_yat_casched_account(cpu, job_id, exec_time);
+    return 0;
+}
+/* 查询某任务最近一次执行时间戳 */
+static u64 yat_get_task_last_timestamp(int cpu, int job_id)
+{
+    u64 last_ts = 0;
+    struct yat_history_record *rec;
+    if (cpu < 0 || cpu >= NR_CPUS)
+        return 0;
+    spin_lock(&global_history_tables[cpu].lock);
+    list_for_each_entry(rec, &global_history_tables[cpu].time_list, list) {
+        if (rec->job_id == job_id && rec->timestamp > last_ts) {
+            last_ts = rec->timestamp;
+        }
+    }
+    spin_unlock(&global_history_tables[cpu].lock);
+    return last_ts;
+}
+/* 计算时间区间内的执行时间总和 */
+static u64 yat_sum_exec_time_since(int cpu, u64 start_ts, u64 end_ts)
+{
+    u64 sum = 0;
+    struct yat_history_record *rec;
+    if (cpu < 0 || cpu >= NR_CPUS)
+\end{Verbatim}
+\end{yatpage}
+\newpage
+\begin{yatpage}
+\begin{Verbatim}[fontsize=\fontsize{8.2}{9.8}\selectfont]
+        return 0;
+    spin_lock(&global_history_tables[cpu].lock);
+    list_for_each_entry(rec, &global_history_tables[cpu].time_list, list) {
+        if (rec->timestamp < start_ts)
+            continue;
+        if (rec->timestamp > end_ts)
+            break;
+        sum += rec->exec_time;
+    }
+    spin_unlock(&global_history_tables[cpu].lock);
+    return sum;
+}
+/*
+ * 清理过期的历史记录。
+ *
+ * 链表按时间戳递增，所以从头部扫到第一个未过期即可。
+ * 同样把 kfree 移出临界区。
+ */
+void yat_cleanup_old_records(int cpu, u64 cutoff_time)
+{
+    struct yat_history_record *rec, *tmp;
+    struct yat_cpu_history_table *tbl;
+    LIST_HEAD(expired);
+    if (cpu < 0 || cpu >= NR_CPUS)
+        return;
+    tbl = &global_history_tables[cpu];
+    spin_lock(&tbl->lock);
+    list_for_each_entry_safe(rec, tmp, &tbl->time_list, list) {
+        if (rec->timestamp >= cutoff_time)
+            break;
+        list_move_tail(&rec->list, &expired);
+        tbl->nr_records--;
+    }
+    tbl->last_cleanup_time = jiffies;
+    spin_unlock(&tbl->lock);
+    list_for_each_entry_safe(rec, tmp, &expired, list) {
+        list_del(&rec->list);
+        kfree(rec);
+    }
+}
+/* 初始化加速表 */
+int yat_accel_table_init(struct yat_accel_table *table)
+{
+    if (!table)
+        return -EINVAL;
+    table->hash_buckets = kcalloc(1 << YAT_ACCEL_HASH_BITS, sizeof(struct hlist_head), GFP
+    _KERNEL);
+    if (!table->hash_buckets)
+        return -ENOMEM;
+    /* 初始化所有哈希桶 */
+    for (int i = 0; i < (1 << YAT_ACCEL_HASH_BITS); i++) {
+        INIT_HLIST_HEAD(&table->hash_buckets[i]);
+    }
+    spin_lock_init(&table->lock);
+    table->last_cleanup_time = jiffies;
+\end{Verbatim}
+\end{yatpage}
+\newpage
+\begin{yatpage}
+\begin{Verbatim}[fontsize=\fontsize{8.2}{9.8}\selectfont]
+    return 0;
+}
+/*
+ * 销毁加速表。
+ *
+ * 原实现在 table->lock 里一边 hlist_del 一边 kfree，还顺手 kfree 了
+ * hash_buckets 本身。kfree 会进 slab 回收器，可能抢 zone/lru 锁，
+ * 在自旋锁内调用是上下文违规（lockdep 会报 invalid context）。
+ *
+ * 改成：持锁只做「把桶数组摘走」和「把全部条目挂到临时链表」，
+ * 解锁后再统一释放条目与桶数组。
+ */
+void yat_accel_table_destroy(struct yat_accel_table *table)
+{
+    struct yat_accel_entry *entry;
+    /*
+     * 两个迭代器必须分开声明：hlist_for_each_entry_safe() 的游标类型是
+     * struct hlist_node *，而 list_for_each_entry_safe() 的游标类型必须是
+     * struct yat_accel_entry *。复用同一个变量会让编译器按第一种用法把
+     * entry 推断成 hlist_node，随后报出「hlist_node 没有 lru_list 成员」。
+     */
+    struct hlist_node *tmp;
+    struct yat_accel_entry *next;
+    struct hlist_head *buckets;
+    LIST_HEAD(doomed);
+    int i;
+    if (!table || !table->hash_buckets)
+        return;
+    spin_lock(&table->lock);
+    buckets = table->hash_buckets;
+    table->hash_buckets = NULL;
+    for (i = 0; i < (1 << YAT_ACCEL_HASH_BITS); i++) {
+        hlist_for_each_entry_safe(entry, tmp, &buckets[i], hash_node) {
+            hlist_del(&entry->hash_node);
+            /*
+             * 借用 lru_list 把条目串到临时链表上 —— 条目此刻已脱离
+             * 哈希表，不会再被查找路径看到，所以可以安全借道。
+             */
+            list_add_tail(&entry->lru_list, &doomed);
+        }
+    }
+    spin_unlock(&table->lock);
+    list_for_each_entry_safe(entry, next, &doomed, lru_list) {
+        list_del(&entry->lru_list);
+        kfree(entry);
+    }
+    kfree(buckets);
+}
+/*
+ * 兼容性：保留原有的加速表操作函数（针对task_pid）
+ */
+/* 生成(task_pid, cpu_id)的哈希值 */
+static u32 yat_accel_hash(pid_t task_pid, int cpu_id)
+{
+    return hash_32((u32)task_pid ^ (u32)cpu_id, YAT_ACCEL_HASH_BITS);
+\end{Verbatim}
+\end{yatpage}
+\newpage
+\begin{yatpage}
+\begin{Verbatim}[fontsize=\fontsize{8.2}{9.8}\selectfont]
+}
+/* 查找加速表条目 */
+static struct yat_accel_entry *yat_accel_find_entry(struct yat_accel_table *table, pid_t t
+    ask_pid, int cpu_id)
+{
+    struct yat_accel_entry *entry;
+    u32 hash_val = yat_accel_hash(task_pid, cpu_id);
+    if (!table || !table->hash_buckets)
+        return NULL;
+    hlist_for_each_entry(entry, &table->hash_buckets[hash_val], hash_node) {
+        if (entry->job_id == task_pid && entry->cpu_id == cpu_id)  /* 使用job_id字段 */
+            return entry;
+    }
+    return NULL;
+}
+/*
+ * 插入加速表条目。
+ *
+ * 原实现在 table->lock 内做 kmalloc(GFP_ATOMIC)，而本函数由
+ * yat_find_best_core_for_job() 在 balance_yat_casched() 里按「每个
+ * online CPU」调用一次 —— 64 核下一次全局调度就有 64 次锁内分配。
+ *
+ * 改为「先无锁分配 → 持锁插入 → 若发现并发插入则释放自己的副本」。
+ * 这是内核里处理 "allocate before lock" 的标准模式：多分配一次远比
+ * 在原子上下文里持锁分配便宜。
+ */
+int yat_accel_table_insert(struct yat_accel_table *table, pid_t task_pid, int cpu_id, u64 
+    benefit, u64 wcet, u64 crp_ratio)
+{
+    struct yat_accel_entry *entry;
+    u32 hash_val;
+    if (!table || !table->hash_buckets)
+        return -EINVAL;
+    /*
+     * 分配放在临界区之外。注意调用上下文是 balance_yat_casched()，
+     * 持 rq_lock 且可能关中断，所以只能用 GFP_ATOMIC。
+     */
+    entry = kmalloc(sizeof(*entry), GFP_ATOMIC);
+    if (!entry)
+        return -ENOMEM;
+    entry->job_id = task_pid;  /* 兼容性：将task_pid存储在job_id字段中 */
+    entry->cpu_id = cpu_id;
+    entry->benefit = benefit;
+    entry->wcet = wcet;
+    entry->crp_ratio = crp_ratio;
+    entry->last_update_time = jiffies;
+    INIT_LIST_HEAD(&entry->lru_list);
+    hash_val = yat_accel_hash(task_pid, cpu_id);
+    spin_lock(&table->lock);
+    /* 检查是否已存在（可能在分配期间被别的 CPU 插入了） */
+    if (yat_accel_find_entry(table, task_pid, cpu_id)) {
+        spin_unlock(&table->lock);
+        kfree(entry);
+        /* 重复条目不是错误，只说明该 (job, cpu) 快照已在表里 */
+        YAT_STAT_INC(accel_dup);
+\end{Verbatim}
+\end{yatpage}
+\newpage
+\begin{yatpage}
+\begin{Verbatim}[fontsize=\fontsize{8.2}{9.8}\selectfont]
+	}
+	return 0;
+}
+static int apply_policy(int use_yat)
+{
+	struct sched_param param;
+	memset(&param, 0, sizeof(param));
+	param.sched_priority = 0;
+	/*
+	 * 用 SCHED_OTHER 而不是 SCHED_NORMAL：后者在 glibc 里被
+	 * __USE_MISC 守卫，静态链接或非默认 feature 宏组合下可能不可见；
+	 * SCHED_OTHER 是 POSIX 常量，任何实现都有。
+	 */
+	if (!use_yat)
+		return sched_setscheduler(0, SCHED_OTHER, &param);
+	return sched_setscheduler(0, SCHED_YAT_CASCHED, &param);
+}
+static void usage(const char *prog)
+{
+	fprintf(stderr,
+		"用法: %s [选项]\n"
+		"  --policy cfs|yat   目标调度策略（默认 cfs）\n"
+		"  --tasks N          并发任务数（默认 4，上限 %d）\n"
+		"  --iters M          每任务固定迭代次数（默认 20000000）\n"
+		"  --cpu C            --affinity shared 时 pin 到的物理 CPU（默认 0）\n"
+		"  --affinity M       亲和性模式：shared（默认，同核竞争）\n"
+		"                     | none（不设亲和性，可跨核，A8 才会被调用）\n"
+		"                     | spread（第 i 个任务上第 i%%在线数 个核）\n"
+		"  --sleep-us U       每段计算后 nanosleep U 微秒，制造真实唤醒（默认 0）\n"
+		"                     注意：纯 busy loop 没有 WF_TTWU，A8 不会被调用\n"
+		"  --verbose          每个阶段打印一行 YTASK 标记（仅用于排查卡死）\n"
+		"  --help             显示本帮助\n",
+		prog, MAX_TASKS);
+}
+static int parse_args(int argc, char **argv, struct bench_options *opt)
+{
+	int i;
+	opt->tasks = 4;
+	opt->iters = 20000000L;
+	opt->cpu = 0;
+	opt->use_yat = 0;
+	opt->affinity = AFFINITY_SHARED;
+	opt->sleep_us = 0;
+	opt->verbose = 0;
+	for (i = 1; i < argc; i++) {
+		if (strcmp(argv[i], "--help") == 0) {
+			usage(argv[0]);
+			return 1;
+		} else if (strcmp(argv[i], "--policy") == 0 && i + 1 < argc) {
+			const char *p = argv[++i];
+			if (strcmp(p, "cfs") == 0)
+				opt->use_yat = 0;
+			else if (strcmp(p, "yat") == 0)
+				opt->use_yat = 1;
+			else {
+\end{Verbatim}
+\end{yatpage}
+\newpage
+\begin{yatpage}
+\begin{Verbatim}[fontsize=\fontsize{8.2}{9.8}\selectfont]
+				fprintf(stderr, "未知策略: %s\n", p);
+				return -1;
+			}
+		} else if (strcmp(argv[i], "--tasks") == 0 && i + 1 < argc) {
+			opt->tasks = atoi(argv[++i]);
+		} else if (strcmp(argv[i], "--iters") == 0 && i + 1 < argc) {
+			opt->iters = atol(argv[++i]);
+		} else if (strcmp(argv[i], "--cpu") == 0 && i + 1 < argc) {
+			opt->cpu = atoi(argv[++i]);
+		} else if (strcmp(argv[i], "--affinity") == 0 && i + 1 < argc) {
+			const char *a = argv[++i];
+			if (strcmp(a, "shared") == 0)
+				opt->affinity = AFFINITY_SHARED;
+			else if (strcmp(a, "none") == 0)
+				opt->affinity = AFFINITY_NONE;
+			else if (strcmp(a, "spread") == 0)
+				opt->affinity = AFFINITY_SPREAD;
+			else {
+				fprintf(stderr, "未知亲和性模式: %s\n", a);
+				return -1;
+			}
+		} else if (strcmp(argv[i], "--sleep-us") == 0 && i + 1 < argc) {
+			opt->sleep_us = atol(argv[++i]);
+		} else if (strcmp(argv[i], "--verbose") == 0) {
+			opt->verbose = 1;
+		} else {
+			fprintf(stderr, "无法识别的参数: %s\n", argv[i]);
+			return -1;
+		}
+	}
+	if (opt->tasks <= 0 || opt->tasks > MAX_TASKS) {
+		fprintf(stderr, "任务数必须在 1..%d 之间\n", MAX_TASKS);
+		return -1;
+	}
+	if (opt->iters <= 0) {
+		fprintf(stderr, "迭代次数必须为正\n");
+		return -1;
+	}
+	if (opt->cpu < 0) {
+		fprintf(stderr, "CPU 号必须非负\n");
+		return -1;
+	}
+	if (opt->sleep_us < 0) {
+		fprintf(stderr, "sleep 微秒数必须非负\n");
+		return -1;
+	}
+	return 0;
+}
+/*
+ * 阶段标记。
+ *
+ * 为什么要有它：guest 一旦卡死，串口上没有任何输出，内核也没有 splat
+ * （说明不是 BUG/死锁，而是任务永远拿不到 CPU）。这时唯一能区分
+ * 「卡在策略切换前 / 卡在计算中 / 卡在收尾 syscall / 卡在写管道」
+ * 的证据，就是用户态自己在每个阶段打一行。
+\end{Verbatim}
+\end{yatpage}
+\newpage
+\begin{yatpage}
+\begin{Verbatim}[fontsize=\fontsize{8.2}{9.8}\selectfont]
+ *
+ * 只在 --verbose 下开启：正常测量时任何 write() 都会引入
+ * 自愿上下文切换，污染 vol_ctx 与 wall time。
+ */
+static void stage_mark(const struct bench_options *opt, int task_id, const char *what)
+{
+	if (!opt->verbose)
+		return;
+	fprintf(stderr, "YTASK %d %s\n", task_id, what);
+	fflush(stderr);
+}
+static void child_main(int fd, int task_id, const struct bench_options *opt)
+{
+	struct bench_record rec;
+	uint64_t t0, t1;
+	memset(&rec, 0, sizeof(rec));
+	rec.task_id = (uint32_t)task_id;
+	rec.work_units = 0;
+	stage_mark(opt, task_id, "enter");
+	/*
+	 * 先设亲和性再设策略，最后才开始计时：把 sched_setaffinity /
+	 * sched_setscheduler 的系统调用开销排除在测量窗口之外。
+	 */
+	if (apply_affinity(opt, task_id) != 0) {
+		rec.error = errno;
+		(void)write_record(fd, &rec);
+		_exit(1);
+	}
+	stage_mark(opt, task_id, "affinity-done");
+	if (apply_policy(opt->use_yat) != 0) {
+		/*
+		 * 内核未启用 SCHED_CLASS_YAT_CASCHED 时这里会返回 EINVAL。
+		 * 把 errno 带回父进程，让它以专门的状态码退出 —— 宿主脚本
+		 * 据此判断"内核没编进这个调度类"，而不是把失败当成性能数据。
+		 */
+		rec.error = errno;
+		(void)write_record(fd, &rec);
+		_exit(1);
+	}
+	rec.sched_ok = 1;
+	stage_mark(opt, task_id, "policy-applied");
+	t0 = now_ns();
+	(void)do_work(opt->iters, opt->sleep_us);
+	t1 = now_ns();
+	stage_mark(opt, task_id, "work-done");
+	rec.wall_ns = t1 - t0;
+	rec.work_units = (uint64_t)opt->iters;
+	read_ctx_switches(&rec.vol_ctx, &rec.invol_ctx);
+	stage_mark(opt, task_id, "csw-read");
+	if (write_record(fd, &rec) != 0)
+		_exit(1);
+	stage_mark(opt, task_id, "written");
+	_exit(0);
+}
+static const char *affinity_name(int mode)
+\end{Verbatim}
+\end{yatpage}
+\newpage
+\begin{yatpage}
+\begin{Verbatim}[fontsize=\fontsize{8.2}{9.8}\selectfont]
+{
+	switch (mode) {
+	case AFFINITY_NONE:
+		return "none";
+	case AFFINITY_SPREAD:
+		return "spread";
+	case AFFINITY_SHARED:
+	default:
+		return "shared";
+	}
+}
+int main(int argc, char **argv)
+{
+	struct bench_options opt;
+	struct bench_record recs[MAX_TASKS];
+	const char *policy_name;
+	pid_t pids[MAX_TASKS];
+	int pipefd[2];
+	int ret, i, got = 0;
+	uint64_t sum_wall = 0, min_wall = UINT64_MAX, max_wall = 0;
+	uint64_t sum_vol = 0, sum_invol = 0, sum_work = 0;
+	int sched_failed = 0;
+	ret = parse_args(argc, argv, &opt);
+	if (ret != 0)
+		return ret > 0 ? 0 : 2;
+	policy_name = opt.use_yat ? "yat" : "cfs";
+	if (pipe(pipefd) != 0) {
+		perror("pipe");
+		return 2;
+	}
+	for (i = 0; i < opt.tasks; i++) {
+		pid_t pid = fork();
+		if (pid < 0) {
+			perror("fork");
+			/* 已经 fork 出去的子进程仍会写 pipe，父进程按 got 处理 */
+			break;
+		}
+		if (pid == 0) {
+			close(pipefd[0]);
+			child_main(pipefd[1], i, &opt);
+			_exit(1); /* 不可达 */
+		}
+		pids[i] = pid;
+	}
+	/*
+	 * 父进程必须关掉写端：否则子进程全部退出后 read() 仍会阻塞，
+	 * 因为管道里还有父进程自己持有的写端引用。这是 pipe 编程里
+	 * 最经典的一处死锁。
+	 */
+	close(pipefd[1]);
+	while (got < opt.tasks) {
+		ssize_t n = read(pipefd[0], &recs[got], sizeof(recs[got]));
+		if (n == 0)
+			break;			/* 所有写端已关闭 */
+		if (n < 0) {
+\end{Verbatim}
+\end{yatpage}
+\newpage
+\begin{yatpage}
+\begin{Verbatim}[fontsize=\fontsize{8.2}{9.8}\selectfont]
+			if (errno == EINTR)
+				continue;
+			perror("read");
+			break;
+		}
+		if ((size_t)n != sizeof(recs[got])) {
+			/*
+			 * 短读意味着某个子进程在 write 中途崩溃。丢弃这条
+			 * 不完整记录，继续读下一条 —— 宁可少一个样本，
+			 * 也不要把半截数据当成测量结果。
+			 */
+			fprintf(stderr, "警告: 收到不完整记录 (%zd 字节)\n", n);
+			continue;
+		}
+		got++;
+	}
+	close(pipefd[0]);
+	for (i = 0; i < opt.tasks; i++)
+		(void)waitpid(pids[i], NULL, 0);
+	if (got == 0) {
+		fprintf(stderr, "错误: 没有收到任何测量记录\n");
+		return 2;
+	}
+	for (i = 0; i < got; i++) {
+		if (recs[i].error != 0) {
+			sched_failed = 1;
+			fprintf(stderr,
+				"任务 %u 失败: errno=%d (%s)%s\n",
+				recs[i].task_id, recs[i].error,
+				strerror(recs[i].error),
+				recs[i].sched_ok ? "" : " —— 设置调度策略失败");
+			continue;
+		}
+		sum_wall += recs[i].wall_ns;
+		if (recs[i].wall_ns < min_wall)
+			min_wall = recs[i].wall_ns;
+		if (recs[i].wall_ns > max_wall)
+			max_wall = recs[i].wall_ns;
+		sum_vol += recs[i].vol_ctx;
+		sum_invol += recs[i].invol_ctx;
+		sum_work += recs[i].work_units;
+	}
+	if (sched_failed) {
+		fprintf(stderr,
+			"错误: 无法在 %d 个任务上应用策略 '%s'。"
+			"请确认内核配置了 CONFIG_SCHED_CLASS_YAT_CASCHED=y。\n",
+			got, policy_name);
+		return 3;
+	}
+	if (min_wall == UINT64_MAX)
+		min_wall = 0;
+	/*
+	 * 输出格式（单行 CSV，数值单位见列名）：
+	 *   YATCSV,policy,tasks,iters,cpu,sum_wall_ns,min_wall_ns,max_wall_ns,
+	 *          sum_work_units,vol_ctx,invol_ctx,cpus_online,affinity,sleep_us
+\end{Verbatim}
+\end{yatpage}
+\newpage
+\begin{yatpage}
+\begin{Verbatim}[fontsize=\fontsize{8.2}{9.8}\selectfont]
+	 *
+	 * 全部用整数纳米秒，避免浮点在 guest/host 之间出现格式化差异。
+	 *
+	 * affinity / sleep_us **追加在末尾**，不插在中间：宿主脚本用
+	 * cut -f 取固定列号，插在中间会让所有旧字段错位。这两个新列是
+	 * 数据自描述的一部分 —— 没有它们就无法判断一行 CSV 到底测的是
+	 * 「同核竞争」还是「跨核放置」，而这直接决定数据能不能用来谈 AJLR。
+	 */
+	printf("YATCSV,%s,%d,%ld,%d,%llu,%llu,%llu,%llu,%llu,%llu,%ld,%s,%ld\n",
+	       policy_name, opt.tasks, opt.iters, opt.cpu,
+	       (unsigned long long)sum_wall,
+	       (unsigned long long)min_wall,
+	       (unsigned long long)max_wall,
+	       (unsigned long long)sum_work,
+	       (unsigned long long)sum_vol,
+	       (unsigned long long)sum_invol,
+	       sysconf(_SC_NPROCESSORS_ONLN),
+	       affinity_name(opt.affinity),
+	       opt.sleep_us);
+	fflush(stdout);
+	return 0;
+}
+/* ==================== 文件：linux-6.8-main/boot_test_scripts/yat_simple_test.c ==================== */
+/*
+ * YAT_CASCHED 简化调度器测试程序
+ * 创建多个任务测试YAT调度器功能
+ */
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <sys/syscall.h>
+#include <sched.h>
+#include <errno.h>
+#include <string.h>
+#include <sys/time.h>
+#include <signal.h>
+#define SCHED_YAT_CASCHED 8  // YAT_CASCHED调度策略
+// 模拟工作负载的函数
+void do_work(int task_id, int work_time_ms) {
+    struct timeval start, end;
+    gettimeofday(&start, NULL);
+    printf("[Task %d] 开始工作，目标时间：%d ms\n", task_id, work_time_ms);
+    // CPU密集型工作
+    volatile long long counter = 0;
+    long long target = (long long)work_time_ms * 1000000;  // 根据时间调整计算量
+    while (counter < target) {
+        counter++;
+        // 每隔一段时间检查是否被调度
+        if (counter % 100000 == 0) {
+            gettimeofday(&end, NULL);
+            long elapsed = (end.tv_sec - start.tv_sec) * 1000 +
+                          (end.tv_usec - start.tv_usec) / 1000;
+            if (elapsed >= work_time_ms) {
+\end{Verbatim}
+\end{yatpage}
+\newpage
+\begin{yatpage}
+\begin{Verbatim}[fontsize=\fontsize{8.2}{9.8}\selectfont]
+                break;
+            }
+        }
+    }
+    gettimeofday(&end, NULL);
+    long elapsed = (end.tv_sec - start.tv_sec) * 1000 +
+                  (end.tv_usec - start.tv_usec) / 1000;
+    printf("[Task %d] 完成工作，实际用时：%ld ms\n", task_id, elapsed);
+}
+// 设置调度策略
+int set_yat_scheduler(pid_t pid, int priority) {
+    struct sched_param param;
+    param.sched_priority = priority;
+    // 尝试设置YAT_CASCHED调度策略
+    if (sched_setscheduler(pid, SCHED_YAT_CASCHED, &param) == 0) {
+        printf("成功设置YAT_CASCHED调度策略，优先级：%d\n", priority);
+        return 0;
+    } else {
+        printf("设置YAT_CASCHED失败: %s，使用默认调度策略\n", strerror(errno));
+        return -1;
+    }
+}
+// 获取当前CPU
+int get_current_cpu() {
+    return sched_getcpu();
+}
+// 子任务函数
+void child_task(int task_id, int priority, int work_cycles) {
+    printf("[Task %d] PID: %d, 开始执行，sched_priority: %d\n", task_id, getpid(), priorit
+    y);
+    // 设置调度策略 - 使用传入的优先级
+    if (set_yat_scheduler(0, priority) == 0) {
+        printf("[Task %d] YAT调度器设置成功，sched_priority: %d\n", task_id, priority);
+    }
+    // 执行多个工作周期
+    for (int cycle = 0; cycle < work_cycles; cycle++) {
+        int current_cpu = get_current_cpu();
+        printf("[Task %d] 周期 %d，当前CPU: %d\n", task_id, cycle + 1, current_cpu);
+        // 执行工作
+        do_work(task_id, 50 + (task_id * 10));  // 不同任务有不同的工作时间
+        // 短暂休眠，让其他任务有机会运行
+        usleep(10000);  // 10ms
+    }
+    printf("[Task %d] 完成所有工作周期\n", task_id);
+}
+int main() {
+    printf("=== YAT_CASCHED 调度器简化测试 ===\n");
+    printf("当前内核版本测试，PID: %d\n", getpid());
+    // 显示CPU信息
+    int num_cpus = sysconf(_SC_NPROCESSORS_ONLN);
+    printf("系统CPU数量: %d\n", num_cpus);
+    const int num_tasks = 5;
+    const int work_cycles = 3;
+    pid_t children[num_tasks];
+    // 创建多个子进程进行测试
+\end{Verbatim}
+\end{yatpage}
+\newpage
+\begin{yatpage}
+\begin{Verbatim}[fontsize=\fontsize{8.2}{9.8}\selectfont]
+    printf("\n开始创建测试任务...\n");
+    for (int i = 0; i < num_tasks; i++) {
+        pid_t pid = fork();
+        if (pid == 0) {
+            // 子进程 - 目前YAT_CASCHED只支持优先级0
+            // 不同的job_priority将在调度器内部处理
+            int priority = 0;  // 所有任务都使用相同的sched_priority
+            int job_priority;  // 内部作业优先级
+            switch (i) {
+                case 0: job_priority = 6; break;  // 高优先级
+                case 1: job_priority = 8;  break;  // 较高优先级
+                case 2: job_priority = 0;   break;  // 普通优先级
+                case 3: job_priority = 5;   break;  // 较低优先级
+                case 4: job_priority = 10;  break;  // 低优先级
+                default: job_priority = 0;  break;
+            }
+            child_task(i + 1, job_priority, work_cycles);
+            exit(0);
+        } else if (pid > 0) {
+            // 父进程
+            children[i] = pid;
+            printf("创建子任务 %d，PID: %d\n", i + 1, pid);
+        } else {
+            perror("fork失败");
+            exit(1);
+        }
+    }
+    // 父进程等待所有子进程完成
+    printf("\n等待所有任务完成...\n");
+    for (int i = 0; i < num_tasks; i++) {
+        int status;
+        waitpid(children[i], &status, 0);
+        printf("任务 %d (PID: %d) 已完成\n", i + 1, children[i]);
+    }
+    printf("\n=== 所有测试任务完成 ===\n");
+    // 显示一些调度统计信息
+    printf("\n--- 调度器测试总结 ---\n");
+    printf("测试任务数量: %d\n", num_tasks);
+    printf("每个任务工作周期: %d\n", work_cycles);
+    printf("系统CPU数量: %d\n", num_cpus);
+    printf("调度策略: YAT_CASCHED (所有任务sched_priority=0)\n");
+    printf("内部作业优先级分配:\n");
+    printf("  任务1: job_priority 6 (普通优先级)\n");
+    printf("  任务2: job_priority 8  (较低优先级)\n");
+    printf("  任务3: job_priority 0   (最高优先级)\n");
+    printf("  任务4: job_priority 5   (较高优先级)\n");
+    printf("  任务5: job_priority 10  (最低优先级)\n");
+    printf("期望结果: 高job_priority任务应该获得更多CPU时间\n");
+    return 0;
+}
+/* ==================== 文件：linux-6.8-main/boot_test_scripts/yat_affinity_test.c ==================== */
+#define _GNU_SOURCE
+#include <sched.h>
+#include <stdio.h>
+#include <stdlib.h>
+\end{Verbatim}
+\end{yatpage}
+\newpage
+\begin{yatpage}
+\begin{Verbatim}[fontsize=\fontsize{8.2}{9.8}\selectfont]
+#include <unistd.h>
+#include <time.h>
+#include <errno.h>
+/* Four-vCPU guest required. Inspect AJLR intent, not only core fallback. */
+static int phase(int first)
+{
+    cpu_set_t mask;
+    CPU_ZERO(&mask); CPU_SET(first, &mask); CPU_SET(first + 1, &mask);
+    if (sched_setaffinity(0, sizeof(mask), &mask)) { perror("affinity"); return 1; }
+    cpu_set_t effective;
+    CPU_ZERO(&effective);
+    if (sched_getaffinity(0, sizeof(effective), &effective)) { perror("getaffinity"); retu
+    rn 6; }
+    if (!CPU_EQUAL(&effective, &mask)) {
+        printf("MASK-MISMATCH requested=%d,%d count=%d\n", first, first+1, CPU_COUNT(&effe
+    ctive));
+        return 7;
+    }
+    for (int i = 0; i < 100; i++) {
+        struct timespec pause = {0, 2000000};
+        if (nanosleep(&pause, NULL)) { perror("nanosleep"); return 1; }
+        int actual = sched_getcpu();
+        if (actual != first && actual != first + 1) { printf("RUN-MISMATCH actual=%d mask=
+    %d,%d\n", actual, first, first+1); return 2; }
+    }
+    FILE *f = fopen("/sys/kernel/debug/yat_casched/placements", "r");
+    if (!f) { perror("placements"); return 3; }
+    char line[256]; int found = 0, bad = 0;
+    while (fgets(line, sizeof(line), f)) {
+        int job, pid, prio, assigned, actual;
+        if (sscanf(line, "%d%d%d%d%d", &job, &pid, &prio, &assigned, &actual) == 5 && pid 
+    == getpid()) {
+            found = 1;
+            printf("PHASE mask=%d,%d assigned=%d actual=%d\n", first, first+1, assigned, a
+    ctual);
+            bad = assigned != first && assigned != first + 1;
+        }
+    }
+    fclose(f);
+    return !found ? 4 : bad ? 5 : 0;
+}
+int main(void)
+{
+    struct sched_param param = {0};
+    if (sched_setscheduler(0, 8, &param)) { perror("SCHED_YAT_CASCHED"); return 1; }
+    int rc = phase(0);
+    if (!rc) rc = phase(2);
+    if (!rc) rc = phase(0);
+    printf("YAT-AFFINITY %s rc=%d\n", rc ? "FAIL" : "PASS", rc);
+    return rc;
+}
+/* ==================== 文件：linux-6.8-main/yat_test_scripts/compare_cfs_vs_yat.sh ==================== */
+#!/bin/bash
+#
+# CFS vs Yat-CASched 同负载自动对比
+\end{Verbatim}
+\end{yatpage}
+\newpage
+\begin{yatpage}
+\begin{Verbatim}[fontsize=\fontsize{8.2}{9.8}\selectfont]
+# ============================================================
+#
+# 目标（A7）：
+#   在**同一个内核**、**同一份负载**、**同一颗 CPU** 上，只改变调度策略，
+#   得到两行可比的 CSV，并直接给出配对差值。这样"Yat 到底有没有用"不再
+#   依赖人肉观察 dmesg，而是一条可复现、可入 CI 的命令。
+#
+# 为什么需要专用 initramfs：
+#   通用的 create_test_initramfs.sh 生成的是**交互式菜单**，需要人工输入，
+#   无法在 CI/无人值守场景下自动出数。本脚本因此自带一份非交互 init：
+#   挂载 proc/sys → 依次跑 cfs 与 yat → poweroff。两份 initramfs 的
+#   boot_test_scripts/*.c 编译规则保持一致（gcc -O2 -static）。
+#
+# 为什么两个策略要各跑一次 QEMU（而不是一次启动内跑两遍）：
+#   1) 策略切换会残留上一轮的热状态（页表、cache、buddy 碎片），第二轮
+#      天然占优；分两次启动让两轮都从"刚启动"的相同初始态出发。
+#   2) 一次启动跑两遍还需在 guest 内做清理，复杂且更容易引入偏差。
+#   代价是多一次 QEMU 启动（TCG 下约数秒），换来的是可比性，值得。
+#
+# 输出：
+#   yat_test_scripts/results/cfs_vs_yat.csv   —— 两行原始数据 + 表头
+#   yat_test_scripts/results/qemu_<policy>.log —— 两次启动的完整串口日志
+#   标准输出：配对对比摘要（墙钟比、上下文切换差）
+#
+# 亲和性（A8 起必须分清，否则会得出错误结论）：
+#   --affinity shared（默认）  全部任务 pin 到一个核 → 同核竞争。
+#     此时 p->nr_cpus_allowed == 1，core.c 的 select_task_rq 直接
+#     cpumask_any()、**不调用调度类回调**，所以 AJLR 一次也不会跑。
+#     这类数据只能谈"时间片分配"，**不能**谈 AJLR。
+#   --affinity none            不设亲和性 → 可跨核，select_task_rq 才会
+#     被调用；配合 --sleep-us 制造 WF_TTWU，才能真的验证 A8。
+#   --affinity spread          第 i 个任务 pin 到第 i%在线数 个核 → 强制
+#     初始分散，观察 AJLR 是否会把它们重新收敛（迁移率）。
+#
+# 为什么需要 --sleep-us：
+#   纯 busy loop 只有 WF_FORK，而 select_task_rq_yat_casched() 刻意在
+#   WF_FORK/WF_EXEC 早退（缓存热度表全零，算出来的放置没有信息量）。
+#   只有阻塞→唤醒（WF_TTWU）才会走到 AJLR。工作量的切分段数固定为
+#   64 段，保证两种策略拿到相同数量的唤醒事件。
+#
+# 内核参数的两个坑（实测得出，勿随意改回）：
+#   1) 必须用 arch/x86/boot/bzImage，不能用 ELF 的 vmlinux：QEMU 的 -kernel
+#      对 x86 ELF 需要 PVH note，本项目内核没有，会直接报
+#      "Error loading uncompressed kernel without PVH ELF Note" 而不启动。
+#   2) 必须保留 ACPI，不要加 acpi=off / noapic / nolapic：-kernel 直接引导
+#      bzImage 时绕过了 BIOS，AP 的枚举只能靠 ACPI MADT；一旦关掉 ACPI，
+#      内核只能看到 1 个 CPU（nr_cpu_ids:1），而"单核上比调度策略"没有意义。
+#      保留 ACPI 后实测 4 核正常起来，且 poweroff 能真正让 QEMU 退出。
+#
+# 用法：
+#   ./compare_cfs_vs_yat.sh                          # 默认 4 任务 / 2e7 迭代 / CPU0
+#   ./compare_cfs_vs_yat.sh --tasks 8 --iters 50000000
+#   ./compare_cfs_vs_yat.sh --kernel ../arch/x86/boot/bzImage --timeout 300
+#   # 验证 A8（AJLR 真的被调用）：
+#   ./compare_cfs_vs_yat.sh --tasks 8 --iters 5000000 \
+\end{Verbatim}
+\end{yatpage}
+\newpage
+\begin{yatpage}
+\begin{Verbatim}[fontsize=\fontsize{8.2}{9.8}\selectfont]
+#        --affinity none --sleep-us 200 --timeout 300
+#
+# 退出码：0 成功；1 前置检查/运行失败；3 guest 未能在内核上启用 Yat 调度类。
+set -uo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# ---------------------------------------------------------------------------
+# 并发保护
+#
+# 两次运行共用 results/ 下的 initramfs、qemu_<policy>.log 与最终 CSV。
+# 并行跑会互相覆盖日志，表现为"未在日志中找到 YATCSV 行"这种**假失败**；
+# 更糟的是覆盖发生在解析途中，可能得到一个看起来正常的错数字。
+# 因此这里用 flock 把"一次完整的 cfs+yat 对比"做成不可重入。
+# ---------------------------------------------------------------------------
+YAT_RUN_LOCK="${TMPDIR:-/tmp}/yat_cfs_vs_yat.lock"
+exec 9>"$YAT_RUN_LOCK"
+if command -v flock >/dev/null 2>&1 && ! flock -n 9; then
+    echo "❌ 另一个 compare_cfs_vs_yat.sh 正在运行（锁：$YAT_RUN_LOCK）" >&2
+    echo "   两次运行会共用 results/ 下的日志与 initramfs，必须串行。" >&2
+    exit 3
+fi
+KERNEL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+TASKS=4
+ITERS=20000000
+CPU=0
+CPUS=4
+AFFINITY=shared
+SLEEP_US=0
+# 默认用 bzImage 而非 vmlinux，原因见文件头注释第 1 条。
+KERNEL="$KERNEL_DIR/arch/x86/boot/bzImage"
+TIMEOUT=180
+OUT_DIR="$SCRIPT_DIR/results"
+RESULT_CSV="$OUT_DIR/cfs_vs_yat.csv"
+usage() {
+    sed -n '2,45p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    exit 0
+}
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --tasks)   TASKS="$2"; shift 2 ;;
+        --iters)   ITERS="$2"; shift 2 ;;
+        --cpu)     CPU="$2"; shift 2 ;;
+        --cpus)    CPUS="$2"; shift 2 ;;
+        --affinity)
+            AFFINITY="$2"
+            case "$AFFINITY" in
+                shared|none|spread) ;;
+                *) echo "未知亲和性: $AFFINITY（可选 shared|none|spread）" >&2; exit 2 ;;
+            esac
+            shift 2 ;;
+        --sleep-us) SLEEP_US="$2"; shift 2 ;;
+        --kernel)  KERNEL="$2"; shift 2 ;;
+        --timeout) TIMEOUT="$2"; shift 2 ;;
+        --out)     RESULT_CSV="$2"; shift 2 ;;
+        -h|--help) usage ;;
+        *) echo "未知参数: $1（用 --help 查看用法）" >&2; exit 2 ;;
+\end{Verbatim}
+\end{yatpage}
+\newpage
+\begin{yatpage}
+\begin{Verbatim}[fontsize=\fontsize{8.2}{9.8}\selectfont]
+    esac
+done
+# ---------------------------------------------------------------
+# 0. 前置检查（失败要早，且要说清怎么修）
+# ---------------------------------------------------------------
+fail() { echo "❌ $*" >&2; exit 1; }
+command -v qemu-system-x86_64 >/dev/null 2>&1 || \
+    fail "未找到 qemu-system-x86_64（请安装 qemu-system-x86）"
+command -v gcc >/dev/null 2>&1 || fail "未找到 gcc"
+command -v cpio >/dev/null 2>&1 || fail "未找到 cpio"
+command -v gzip >/dev/null 2>&1 || fail "未找到 gzip"
+# 若用户显式给了 vmlinux，自动改指同目录构建出的 bzImage（并说明原因）。
+case "$KERNEL" in
+    */vmlinux)
+        echo "提示: QEMU 不能直接引导 ELF vmlinux，改用 $(dirname "$KERNEL")/arch/x86/boot
+    /bzImage" >&2
+        KERNEL="$(dirname "$KERNEL")/arch/x86/boot/bzImage"
+        ;;
+esac
+[ -f "$KERNEL" ] || fail "内核不存在: $KERNEL（先 cd $KERNEL_DIR && make -j\$(nproc)）"
+[ -f /bin/busybox ] || fail "未找到 /bin/busybox（请安装 busybox-static）"
+[ -f "$KERNEL_DIR/boot_test_scripts/yat_bench.c" ] || \
+    fail "未找到 $KERNEL_DIR/boot_test_scripts/yat_bench.c"
+# 内核是否真的编进了 Yat 调度类：先查 .config，能省下一次必然失败的 QEMU 启动
+if [ -f "$KERNEL_DIR/.config" ] && \
+   ! grep -q '^CONFIG_SCHED_CLASS_YAT_CASCHED=y' "$KERNEL_DIR/.config"; then
+    fail "当前 .config 未启用 CONFIG_SCHED_CLASS_YAT_CASCHED=y，无从对比。
+   请在 $KERNEL_DIR 中启用该项后重新编译（或运行 scripts/setup-kernel.sh）。"
+fi
+mkdir -p "$OUT_DIR"
+# ---------------------------------------------------------------
+# 1. 编译基准程序（输出到 results/ 下的临时目录，不污染源码目录）
+# ---------------------------------------------------------------
+BUILD_DIR="$OUT_DIR/build"
+rm -rf "$BUILD_DIR"
+mkdir -p "$BUILD_DIR"
+echo "=== CFS vs Yat-CASched 对比 ==="
+echo "内核:     $KERNEL"
+echo "负载:     tasks=$TASKS iters=$ITERS cpu=$CPU cpus=$CPUS affinity=$AFFINITY sleep_us=
+    $SLEEP_US"
+if [ "$AFFINITY" = "shared" ]; then
+    echo "注意:     affinity=shared 时 nr_cpus_allowed=1，select_task_rq 不会调用"
+    echo "          调度类回调 —— 本轮数据**不能**用来评价 AJLR（A8）。"
+fi
+if [ "$SLEEP_US" = "0" ]; then
+    echo "注意:     sleep_us=0 时任务不阻塞，只有 WF_FORK，A8 同样不会触发。"
+fi
+echo ""
+echo "🔧 编译 yat_bench ..."
+if ! gcc -O2 -static -Wall -Wextra \
+        -o "$BUILD_DIR/yat_bench" \
+        "$KERNEL_DIR/boot_test_scripts/yat_bench.c"; then
+    fail "yat_bench.c 编译失败"
+fi
+# ---------------------------------------------------------------
+\end{Verbatim}
+\end{yatpage}
+\newpage
+\begin{yatpage}
+\begin{Verbatim}[fontsize=\fontsize{8.2}{9.8}\selectfont]
+# 2. 生成非交互 initramfs
+# ---------------------------------------------------------------
+INITRAMFS_DIR="$BUILD_DIR/initramfs"
+mkdir -p "$INITRAMFS_DIR"/{bin,proc,sys,dev,tmp}
+cp /bin/busybox "$INITRAMFS_DIR/bin/busybox"
+chmod +x "$INITRAMFS_DIR/bin/busybox"
+cp "$BUILD_DIR/yat_bench" "$INITRAMFS_DIR/bin/yat_bench"
+chmod +x "$INITRAMFS_DIR/bin/yat_bench"
+# guest 侧要跑的策略由内核命令行参数选择：yatbench=cfs / yatbench=yat。
+# 为什么用 cmdline 而不是把策略写死进 init：
+#   同一份 initramfs 可以被多次启动复用，避免"多份 init"产生不一致。
+cat > "$INITRAMFS_DIR/init" << 'INIT_EOF'
+#!/bin/busybox sh
+# 无人值守 init：跑一遍基准，然后关机。
+# 不启 shell —— 本环境唯一目的就是产出 YATCSV 行。
+/bin/busybox mount -t proc proc /proc 2>/dev/null
+/bin/busybox mount -t sysfs sysfs /sys 2>/dev/null
+/bin/busybox mount -t devtmpfs devtmpfs /dev 2>/dev/null
+# debugfs 是 A6 可观测性的入口；挂载失败不影响基准，只是少一段证据。
+/bin/busybox mount -t debugfs debugfs /sys/kernel/debug 2>/dev/null
+# 解析内核命令行里的 yatbench=<policy>
+policy="cfs"
+for arg in $(cat /proc/cmdline); do
+    case "$arg" in
+        yatbench=*) policy="${arg#yatbench=}" ;;
+    esac
+done
+# 负载参数通过 benchmark=<tasks>,<iters>,<cpu>,<affinity>,<sleep_us> 传入。
+# 逐段取而不是手写嵌套的 ${x%%}/${x#*} 剥壳，可读性更好、也不容易漏字段。
+#
+# 注意必须写 /bin/busybox cut：initramfs 里只放了 busybox **二进制**，
+# 没建 applet 符号链接，PATH 里找不到裸 `cut`。
+tasks=4
+iters=20000000
+cpu=0
+affinity=shared
+sleep_us=0
+for arg in $(cat /proc/cmdline); do
+    case "$arg" in
+        benchmark=*)
+            v="${arg#benchmark=}"
+            tasks="$(echo "$v" | /bin/busybox cut -d, -f1)"
+            iters="$(echo "$v" | /bin/busybox cut -d, -f2)"
+            cpu="$(echo "$v" | /bin/busybox cut -d, -f3)"
+            affinity="$(echo "$v" | /bin/busybox cut -d, -f4)"
+            sleep_us="$(echo "$v" | /bin/busybox cut -d, -f5)"
+            ;;
+    esac
+done
+[ -n "$affinity" ] || affinity=shared
+[ -n "$sleep_us" ] || sleep_us=0
+echo "YATBENCH-BEGIN policy=$policy tasks=$tasks iters=$iters cpu=$cpu affinity=$affinity 
+    sleep_us=$sleep_us"
+/bin/yat_bench --policy "$policy" --tasks "$tasks" --iters "$iters" --cpu "$cpu" \
+               --affinity "$affinity" --sleep-us "$sleep_us"
+\end{Verbatim}
+\end{yatpage}
+\newpage
+\begin{yatpage}
+\begin{Verbatim}[fontsize=\fontsize{8.2}{9.8}\selectfont]
+rc=$?
+echo "YATBENCH-EXIT status=$rc"
+echo "YATBENCH-END"
+# A6 运行时证据：debugfs 节点若存在，把内容原样打到串口。
+# 这些计数是 per-CPU 累加值，与调度行为是否真的发生直接相关 ——
+# 若 jobs_placed / accel_inserts 恒为 0，说明 Yat 调度类根本没被调用过，
+# 此时"性能更好"只可能是没走调度路径的假象。
+# placements（A8 新增）必须一起 dump：stats.jobs_placed 只回答「算过几次」，
+# placements 的 verdict 才回答「算完有没有被内核采纳」。少了它就无法区分
+# 「AJLR 在算但决策被亲和性/回落逻辑推翻」与「AJLR 真的接管了放置」。
+if [ -d /sys/kernel/debug/yat_casched ]; then
+    echo "YATDEBUG-BEGIN"
+    for f in stats ready_pool dags placements; do
+        echo "--- $f ---"
+        /bin/busybox cat "/sys/kernel/debug/yat_casched/$f" 2>/dev/null
+    done
+    echo "YATDEBUG-END"
+fi
+# 同步文件系统并关机。-f 跳过 init 脚本重入；内核命令行已带 panic=1。
+/bin/busybox sync
+/bin/busybox poweroff -f
+INIT_EOF
+chmod +x "$INITRAMFS_DIR/init"
+IMAGE="$BUILD_DIR/compare_initramfs.cpio.gz"
+( cd "$INITRAMFS_DIR" && find . | cpio -o -H newc 2>/dev/null | gzip > "$IMAGE" )
+echo "✅ initramfs: $IMAGE"
+echo ""
+# ---------------------------------------------------------------
+# 3. 跑两次 QEMU（cfs / yat），只保留 YATCSV 行
+# ---------------------------------------------------------------
+# 内核在本次启动里报出的严重问题。这些行一旦出现，本轮数据不可信 ——
+# KASAN 报告 / lockdep 环路 / oops 都可能让某一轮"看起来很快"（例如
+# 任务其实被 abort 了），所以必须显式失败，而不是把数字照抄进 CSV。
+check_kernel_splats() {
+    local log="$1"
+    local pattern='BUG:|Kernel panic|KASAN:|UBSAN:|possible circular locking|WARNING:.*at 
+    |Oops:|general protection fault|watchdog: BUG'
+    if grep -nEq "$pattern" "$log"; then
+        echo "  ❌ 内核日志中发现异常（本轮数据不可信）:" >&2
+        grep -nE "$pattern" "$log" | head -10 >&2
+        return 1
+    fi
+    return 0
+}
+run_one() {
+    local policy="$1"
+    local log="$OUT_DIR/qemu_${policy}.log"
+    # 注意：本函数的标准输出**只能**是那一行 YATCSV —— 调用方用
+    # $(run_one ...) 捕获它。所有进度/诊断信息必须走 stderr，否则会污染数据。
+    echo "▶ 运行 QEMU: policy=$policy（smp=${CPUS}，超时 ${TIMEOUT}s）..." >&2
+    # -no-reboot 防止 panic 后反复重启；timeout 兜住内核卡死。
+    # 串口输出直接写日志文件（不 tee），便于失败后完整回看。
+    #
+    # 内核参数说明（本文件头有更详细的踩坑记录）：
+    #   保留 ACPI → 只有靠 ACPI MADT 才能枚举 AP，否则 nr_cpu_ids 退化成 1；
+\end{Verbatim}
+\end{yatpage}
+\newpage
+\begin{yatpage}
+\begin{Verbatim}[fontsize=\fontsize{8.2}{9.8}\selectfont]
+    #   nokaslr  → 固定地址，日志更好读，也避免 TCG 下 KASLR 带来的差异；
+    #   panic=1  → 出错立刻重启（配合 -no-reboot 即立刻退出），不要挂死等超时。
+    timeout "$TIMEOUT" qemu-system-x86_64 \
+        -kernel "$KERNEL" \
+        -initrd "$IMAGE" \
+        -m 1024 \
+        -smp "$CPUS" \
+        -nographic \
+        -no-reboot \
+        -accel tcg \
+        -append "console=ttyS0,115200 panic=1 nokaslr yatbench=${policy} benchmark=${TASKS
+    },${ITERS},${CPU},${AFFINITY},${SLEEP_US}" \
+        > "$log" 2>&1
+    local rc=$?
+    if [ $rc -eq 124 ]; then
+        echo "  ⚠️  QEMU 超时（${TIMEOUT}s）：见 $log" >&2
+    fi
+    # 先查内核 splat，再取数据：避免把"崩溃前的最后一行"当成有效测量。
+    check_kernel_splats "$log" || return 1
+    local line
+    line="$(grep -m1 '^YATCSV,' "$log" || true)"
+    if [ -z "$line" ]; then
+        echo "  ❌ 未在日志中找到 YATCSV 行: $log" >&2
+        echo "     末尾 25 行：" >&2
+        tail -25 "$log" >&2
+        # 退出码 3 = guest 明确报告"无法应用该策略"
+        if grep -q 'YATBENCH-EXIT status=3' "$log"; then
+            return 3
+        fi
+        return 1
+    fi
+    if ! grep -q 'YATBENCH-EXIT status=0' "$log"; then
+        echo "  ❌ guest 报告基准程序非零退出（见 $log）" >&2
+        grep -E 'YATBENCH-EXIT|失败|错误' "$log" | head -5 >&2
+        return 1
+    fi
+    # 把 A6 的 debugfs 计数器回显到结果里，并标注「AJLR 是否真的参与了调度」。
+    #
+    # 历史背景：A8 之前 yat_ajlr_enqueue_task() 只绑定 job、不选核，pick_next
+    # 读的是本地链表，因此 jobs_placed==0 是当时的真实状态。A8 把
+    # select_task_rq 接成真正的选核路径后，该值应当非零；因此这里不再把
+    # jobs_placed==0 当成「已解释的正常现象」，而是当成**回归信号**。
+    if grep -q '^YATDEBUG-BEGIN' "$log"; then
+        echo "  ── A6 计数器 (policy=$policy) ──" >&2
+        sed -n '/YATDEBUG-BEGIN/,/^--- ready_pool ---/p' "$log" \
+            | grep -E 'balance_|pool_|jobs_|history_|accel_|select_|enq_|ttwu_|pick_|deq_|
+    place_|nr_cpu_ids' \
+            | sed 's/^/     /' >&2
+        # 读取单个计数器（stats 每行 "name  value"）。
+        # 注意 tr -d '\r'：串口是 CRLF，不剥掉会让 $2 变成 "0\r"，
+        # 后续 $(()) 直接报 "invalid arithmetic operator"。
+        counter() {
+            sed -n "/^$1[[:space:]]/p" "$log" | tr -d '\r' | awk '{print $2}' | head -1
+        }
+        local placed calls not_ttwu nojob sticky_idle sticky_intv nocore decided
+\end{Verbatim}
+\end{yatpage}
+\newpage
+\begin{yatpage}
+\begin{Verbatim}[fontsize=\fontsize{8.2}{9.8}\selectfont]
+        local enq calls_allowed
+        placed="$(counter jobs_placed)"
+        calls="$(counter select_calls)"
+        not_ttwu="$(counter select_not_ttwu)"
+        nojob="$(counter select_nojob)"
+        sticky_idle="$(counter select_sticky_idle)"
+        sticky_intv="$(counter select_sticky_intv)"
+        nocore="$(counter select_nocore)"
+        decided="$(counter select_decided)"
+        enq="$(counter enq_calls)"
+        calls_allowed="$(counter enq_cpus_allowed)"
+        local hit miss pend
+        hit="$(counter place_hit)"
+        miss="$(counter place_miss)"
+        pend="$(counter place_pending)"
+        if [ "${placed:-x}" = "0" ]; then
+            echo "  ⚠️  jobs_placed=0：AJLR 未完成任何作业放置。" >&2
+            # 用 select_* 探针区分「回调没被调用」与「调用了但早退」。
+            # 这正是加这些计数器的目的 —— 只看 jobs_placed 无法判断。
+            if [ "${calls:-0}" = "0" ]; then
+                echo "      原因：select_task_rq_yat_casched() **一次都没被调用**。" >&2
+                echo "      已入队 ${enq:-0} 次，累计 nr_cpus_allowed=${calls_allowed:-0}"
+     >&2
+                echo "      （平均每个任务可运行的 CPU 数 = 后者/前者）" >&2
+                if [ "${calls_allowed:-0}" = "${enq:-0}" ] && [ "${enq:-0}" != "0" ]; then
+                    echo "      ⇒ 平均为 1：任务被 pin 死在单核，core.c 包装层直接" >&2
+                    echo "        cpumask_any() 返回，根本不会转发给调度类。" >&2
+                    echo "        请检查 guest 内是否有 cpuset/亲和性限制（--affinity none
+     应无限制）。" >&2
+                else
+                    echo "      ⇒ 平均 > 1：包装层条件满足，说明 select_task_rq 未被调用是
+    " >&2
+                    echo "        别的原因（如任务始终 on_cpu、走 ttwu wakelist 快路径）。
+    " >&2
+                fi
+            else
+                echo "      原因：回调被调用 ${calls} 次，但全部提前返回：" >&2
+                echo "        非唤醒路径(WF_FORK/EXEC) ${not_ttwu:-0}" >&2
+                echo "        建 job 失败             ${nojob:-0}" >&2
+                echo "        节流-目标核空闲         ${sticky_idle:-0}" >&2
+                echo "        节流-不足最小间隔       ${sticky_intv:-0}" >&2
+                echo "        找不到可用核心          ${nocore:-0}" >&2
+                echo "        真正完成决策            ${decided:-0}" >&2
+            fi
+        elif [ "${decided:-1}" != "0" ] && [ "${placed:-0}" = "0" ]; then
+            echo "  ⚠️  select_decided 非零但 jobs_placed==0：计数器与放置逻辑不一致，" >
+    &2
+            echo "      属于内核实现缺陷，需检查 yat_find_best_core_for_job() 里的 INC 位
+    置。" >&2
+        fi
+        # AJLR 接管率：place_* 是 pick 时累加的，不受「作业随任务退出而释放」影响。
+        # placements 表在 workload 结束后必然为空，因此这三个量才是可留存的证据。
+        if [ "$(counter place_hit)" != "" ]; then
+            local total_p
+            total_p=$(( ${hit:-0} + ${miss:-0} + ${pend:-0} ))
+\end{Verbatim}
+\end{yatpage}
+\newpage
+\begin{yatpage}
+\begin{Verbatim}[fontsize=\fontsize{8.2}{9.8}\selectfont]
+            if [ "$total_p" -gt 0 ] 2>/dev/null; then
+                echo "  ── AJLR 接管率 (policy=$policy) ──" >&2
+                echo "     命中 assigned_cpu: ${hit:-0}  否决: ${miss:-0}  未决策: ${pend:
+    -0}  合计: $total_p" >&2
+                echo "     命中率: $(( ${hit:-0} * 100 / total_p ))%（pick 时按 assigned_c
+    pu 与运行核比对）" >&2
+            fi
+        fi
+        # placements 的 verdict 分布 = AJLR 的真实接管率。
+        if grep -q '^--- placements ---' "$log"; then
+            echo "  ── A8 placements (policy=$policy) ──" >&2
+            sed -n '/^--- placements ---/,/^YATDEBUG-END/p' "$log" \
+                | sed '1d;$d' | sed 's/^/     /' >&2
+        fi
+    fi
+    # 单核下"调度策略对比"没有意义，必须显式指出而不是默默产出数字。
+    # 注意必须 tr -d '\r'：串口是 CRLF，残留的 \r 会让 [ -lt ] 报
+    # "integer expression expected"。
+    local online
+    online="$(printf '%s' "$line" | tr -d '\r' | cut -d, -f12)"
+    if [ "${online:-0}" -lt 2 ] 2>/dev/null; then
+        echo "  ⚠️  guest 只有 ${online} 个在线 CPU，对比结果不具备参考价值。" >&2
+        echo "      检查是否误加了 acpi=off/noapic/nolapic（见脚本头注释）" >&2
+    fi
+    printf '%s\n' "$line"
+    return 0
+}
+CFS_LINE="$(run_one cfs)" || fail "CFS 轮次失败"
+# 单独区分退出码 3：不是脚本问题，而是目标内核没有这个调度类。
+YAT_LINE="$(run_one yat)"
+YAT_RC=$?
+if [ $YAT_RC -eq 3 ]; then
+    fail "目标内核未启用 CONFIG_SCHED_CLASS_YAT_CASCHED（guest 报 EINVAL）。
+   当前 .config 检查通过的话，请确认 vmlinux/bzImage 确实是用该 .config 编出来的。"
+elif [ $YAT_RC -ne 0 ]; then
+    fail "Yat 轮次失败（rc=$YAT_RC）"
+fi
+# ---------------------------------------------------------------
+# 4. 落盘 CSV
+# ---------------------------------------------------------------
+{
+    echo "policy,tasks,iters,cpu,sum_wall_ns,min_wall_ns,max_wall_ns,sum_work_units,vol_ct
+    x,invol_ctx,cpus_online,affinity,sleep_us"
+    printf '%s\n' "$CFS_LINE" | sed 's/^YATCSV,//'
+    printf '%s\n' "$YAT_LINE" | sed 's/^YATCSV,//'
+} > "$RESULT_CSV"
+# ---------------------------------------------------------------
+# 5. 配对摘要
+# ---------------------------------------------------------------
+# 字段位置（去掉 YATCSV 前缀后）：
+#   1 policy  2 tasks  3 iters  4 cpu  5 sum_wall  6 min_wall  7 max_wall
+#   8 sum_work  9 vol_ctx  10 invol_ctx  11 cpus_online
+#   12 affinity  13 sleep_us（A8 追加，判断这组数据能否谈 AJLR 的依据）
+field() { printf '%s' "$1" | tr -d '\r' | sed 's/^YATCSV,//' | cut -d, -f"$2"; }
+C_POLICY=$(field "$CFS_LINE" 1);  Y_POLICY=$(field "$YAT_LINE" 1)
+\end{Verbatim}
+\end{yatpage}
+\newpage
+\begin{yatpage}
+\begin{Verbatim}[fontsize=\fontsize{8.2}{9.8}\selectfont]
+C_WALL=$(field "$CFS_LINE" 5);    Y_WALL=$(field "$YAT_LINE" 5)
+C_MIN=$(field "$CFS_LINE" 6);     Y_MIN=$(field "$YAT_LINE" 6)
+C_MAX=$(field "$CFS_LINE" 7);     Y_MAX=$(field "$YAT_LINE" 7)
+C_VOL=$(field "$CFS_LINE" 9);     Y_VOL=$(field "$YAT_LINE" 9)
+C_INV=$(field "$CFS_LINE" 10);    Y_INV=$(field "$YAT_LINE" 10)
+# awk 做浮点：纯 shell 没有可靠的浮点运算。
+read -r WALL_RATIO MIN_RATIO MAX_RATIO < <(awk -v cw="$C_WALL" -v yw="$Y_WALL" \
+                                              -v cm="$C_MIN"  -v ym="$Y_MIN" \
+                                              -v cx="$C_MAX"  -v yx="$Y_MAX" \
+    'BEGIN{ printf "%.4f %.4f %.4f\n", (cw?yw/cw:0), (cm?ym/cm:0), (cx?yx/cx:0) }')
+echo ""
+echo "=========================================="
+echo " 配对对比结果"
+echo "=========================================="
+printf ' %-14s %-16s %-16s\n' "指标" "$C_POLICY" "$Y_POLICY"
+printf ' %-14s %-16s %-16s\n' "sum_wall_ns" "$C_WALL" "$Y_WALL"
+printf ' %-14s %-16s %-16s\n' "min_wall_ns" "$C_MIN" "$Y_MIN"
+printf ' %-14s %-16s %-16s\n' "max_wall_ns" "$C_MAX" "$Y_MAX"
+printf ' %-14s %-16s %-16s\n' "vol_ctx" "$C_VOL" "$Y_VOL"
+printf ' %-14s %-16s %-16s\n' "invol_ctx" "$C_INV" "$Y_INV"
+echo "------------------------------------------"
+echo " sum_wall 比 (yat/cfs): $WALL_RATIO   （<1 表示 Yat 更快）"
+echo " min_wall 比 (yat/cfs): $MIN_RATIO"
+echo " max_wall 比 (yat/cfs): $MAX_RATIO"
+echo " 上下文切换差 (yat-cfs): vol=$((Y_VOL - C_VOL))  invol=$((Y_INV - C_INV))"
+echo "------------------------------------------"
+echo " 本轮负载: affinity=$AFFINITY sleep_us=$SLEEP_US"
+if [ "$AFFINITY" = "shared" ] || [ "$SLEEP_US" = "0" ]; then
+    echo " ⚠️  这组数据**不能**用来评价 AJLR（A8）："
+    [ "$AFFINITY" = "shared" ] && \
+        echo "     affinity=shared → nr_cpus_allowed=1，select_task_rq 不调调度类"
+    [ "$SLEEP_US" = "0" ] && \
+        echo "     sleep_us=0    → 无 WF_TTWU，唤醒路径不发生"
+    echo "     只能解读为「同核竞争下时间片分配」的差异。"
+else
+    echo " ✅ 这组负载满足 A8 的前提（可跨核 + 有唤醒），"
+    echo "    placements 的 ok/denied 才是 AJLR 真实接管率的证据。"
+fi
+echo "------------------------------------------"
+echo " CSV: $RESULT_CSV"
+echo " 日志: $OUT_DIR/qemu_cfs.log  $OUT_DIR/qemu_yat.log"
+echo ""
+echo "注意：TCG 模拟下单次测量噪声较大，结论请以多次重复的中位数/分布为准，"
+echo "      不要用单次 sum_wall 的小幅差异当作算法结论。"
+echo "=========================================="
+/* ==================== 文件：linux-6.8-main/yat_test_scripts/create_test_initramfs.sh ==================== */
+#!/bin/bash
+# 创建包含测试程序的 initramfs
+#
+# 设计说明：
+#   早期版本硬编码了 6 个测试程序源文件，但这些源码并不在本仓库中，
+#   导致脚本在干净检出上必然失败。现改为：
+#     1) 扫描 boot_test_scripts/ 下实际存在的 *.c，逐个编译；
+#     2) 只把编译成功的可执行文件打进 initramfs；
+#     3) 一个可执行文件都没有时报错退出（避免产出空壳环境）。
+\end{Verbatim}
+\end{yatpage}
+\newpage
+\begin{yatpage}
+\begin{Verbatim}[fontsize=\fontsize{8.2}{9.8}\selectfont]
+#
+# 目录约定（A7 测试体系统一）：
+#   boot_test_scripts/  只放 C 源码，**绝不允许**出现编译产物。
+#   因此本脚本把可执行文件编译到独立的 BUILD_DIR，
+#   而不是像早期版本那样写成 "$BOOT_DIR/$name"（那会把二进制撒进源码目录）。
+set -euo pipefail
+KERNEL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$KERNEL_DIR"
+BOOT_DIR="boot_test_scripts"          # 只读：C 源码
+BUILD_DIR="test_with_programs_build"  # 只写：编译产物，已被 .gitignore 覆盖
+OUT_DIR="test_with_programs_initramfs"
+OUT_IMAGE="test_with_programs.cpio.gz"
+echo "=== 创建 Yat-CAShed 测试 initramfs ==="
+echo "内核根目录: $KERNEL_DIR"
+# ---------------------------------------------------------------
+# 1. 检查基础工具
+# ---------------------------------------------------------------
+for tool in gcc cpio gzip; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+        echo "❌ 缺少依赖: $tool"
+        echo "请安装: sudo apt install gcc cpio gzip busybox-static qemu-system-x86"
+        exit 1
+    fi
+done
+if [ ! -f /bin/busybox ]; then
+    echo "❌ 未找到 /bin/busybox（需要静态版 busybox）"
+    echo "请安装: sudo apt install busybox-static"
+    exit 1
+fi
+# ---------------------------------------------------------------
+# 2. 编译 boot_test_scripts/ 下实际存在的测试程序
+# ---------------------------------------------------------------
+echo ""
+echo "🔧 编译测试程序..."
+mkdir -p "$BUILD_DIR"
+programs=()
+shopt -s nullglob
+for src in "$BOOT_DIR"/*.c; do
+    name="$(basename "$src" .c)"
+    bin="$BUILD_DIR/$name"
+    echo "  - 编译 $name ..."
+    if gcc -O2 -static -o "$bin" "$src"; then
+        programs+=("$name")
+    else
+        echo "    ⚠️  $name 编译失败，已跳过"
+        rm -f "$bin"
+    fi
+done
+shopt -u nullglob
+if [ ${#programs[@]} -eq 0 ]; then
+    echo "❌ $BOOT_DIR/ 下没有任何可编译的 *.c，无法生成测试环境"
+    echo "   提示：boot_test_scripts/yat_simple_test.c 是当前唯一维护的测试程序"
+    exit 1
+fi
+echo "✅ 可打包程序: ${programs[*]}"
+\end{Verbatim}
+\end{yatpage}
+\newpage
+\begin{yatpage}
+\begin{Verbatim}[fontsize=\fontsize{8.2}{9.8}\selectfont]
+# ---------------------------------------------------------------
+# 3. 组装 initramfs 目录树
+# ---------------------------------------------------------------
+echo ""
+echo "📦 组装 initramfs 目录树..."
+rm -rf "$OUT_DIR"
+mkdir -p "$OUT_DIR"/{bin,sbin,etc,proc,sys,dev,tmp,usr/bin}
+cp /bin/busybox "$OUT_DIR/bin/"
+chmod +x "$OUT_DIR/bin/busybox"
+for name in "${programs[@]}"; do
+    cp "$BUILD_DIR/$name" "$OUT_DIR/bin/"
+    chmod +x "$OUT_DIR/bin/$name"
+done
+# ---------------------------------------------------------------
+# 4. 生成 init 脚本（菜单按实际打包内容动态生成）
+# ---------------------------------------------------------------
+{
+    echo '#!/bin/busybox sh'
+    echo ''
+    echo 'echo "=== Yat-CAShed 测试环境启动成功 ==="'
+    echo 'echo "内核版本: $(busybox uname -r)"'
+    echo ''
+    echo '/bin/busybox mount -t proc proc /proc'
+    echo '/bin/busybox mount -t sysfs sysfs /sys'
+    echo '/bin/busybox mount -t devtmpfs devtmpfs /dev 2>/dev/null || true'
+    echo ''
+    echo '/bin/busybox --install -s'
+    echo ''
+    echo 'echo ""'
+    echo 'echo "📋 可用的测试程序："'
+    for name in "${programs[@]}"; do
+        echo "echo \"  - $name\""
+    done
+    echo 'echo ""'
+    echo 'echo "基本命令：ps / top / free / dmesg / cat /proc/version"'
+    echo 'echo "退出：exit"'
+    echo ''
+    echo 'exec /bin/busybox sh'
+} > "$OUT_DIR/init"
+chmod +x "$OUT_DIR/init"
+# ---------------------------------------------------------------
+# 5. 打包
+# ---------------------------------------------------------------
+echo ""
+echo "🗜️  打包 initramfs..."
+(
+    cd "$OUT_DIR"
+    find . | cpio -o -H newc 2>/dev/null | gzip > "../$OUT_IMAGE"
+)
+echo ""
+echo "✅ 完成: $OUT_IMAGE"
+echo ""
+echo "启动方式："
+echo "  cd $KERNEL_DIR/yat_test_scripts && ./start_test_environment.sh"
+echo "  或手工："
+\end{Verbatim}
+\end{yatpage}
+\newpage
+\begin{yatpage}
+\begin{Verbatim}[fontsize=\fontsize{8.2}{9.8}\selectfont]
+# 注意两点（曾在实跑中踩到）：
+#   1) -kernel 必须指向 arch/x86/boot/bzImage；ELF 的 vmlinux 缺少 Xen PVH note，
+#      QEMU 会报 "Error loading uncompressed kernel without PVH ELF Note"。
+#   2) 不要加 acpi=off / noapic / nolapic：-kernel bzImage 绕过 BIOS，
+#      AP 只能靠 ACPI MADT 枚举，关掉 ACPI 后 guest 会退化成 1 个 CPU。
+echo "  qemu-system-x86_64 -nographic -m 1024 -smp 4 \\"
+echo "      -kernel arch/x86/boot/bzImage \\"
+echo "      -initrd $OUT_IMAGE -append \"console=ttyS0,115200 panic=1 nokaslr\" -accel tcg
+    "
+/* ==================== 文件：scripts/run_kernel_repeats.sh ==================== */
+#!/usr/bin/env bash
+# ---------------------------------------------------------------------------
+# run_kernel_repeats.sh —— 内核实测的重复测量
+#
+# 单次 QEMU/TCG 运行的墙钟噪声很大（同配置三次可差 28%），单点数字不足以支撑
+# "比 CFS 慢多少"这种结论。本脚本对每个配置重复 N 次，输出中位数与全距，
+# 并把每轮的原始 CSV 留档，便于事后复算。
+#
+# 用法：
+#   scripts/run_kernel_repeats.sh --repeats 5 --out docs/validation/2026-11-13/kernel/repe
+    at
+#
+# 产物：
+#   <out>/<tag>/run-<i>.csv    每轮的两行原始数据
+#   <out>/all.csv              全部轮次汇总（ratio 列为 yat/cfs 的 sum_wall 比）
+#   <out>/SUMMARY.txt          每配置的中位数/最小/最大
+# ---------------------------------------------------------------------------
+set -uo pipefail
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+OUT="$REPO/docs/validation/2026-11-13/kernel/repeat"
+REPEATS=5
+TASKS=8
+ITERS=2000000
+TIMEOUT=300
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --repeats) REPEATS="$2"; shift 2 ;;
+    --out)     OUT="$2"; shift 2 ;;
+    --tasks)   TASKS="$2"; shift 2 ;;
+    --iters)   ITERS="$2"; shift 2 ;;
+    --timeout) TIMEOUT="$2"; shift 2 ;;
+    *) echo "unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+KERNEL="$REPO/linux-6.8-main/arch/x86/boot/bzImage"
+SCRIPT="$REPO/linux-6.8-main/yat_test_scripts/compare_cfs_vs_yat.sh"
+mkdir -p "$OUT"
+ALL="$OUT/all.csv"
+echo "tag,run,policy,sum_wall_ns,sum_work_units,vol_ctx,invol_ctx,ratio_yat_over_cfs" > "$
+    ALL"
+# 三个配置：主口径 / 回调不被调用（单核 pin）/ 无唤醒对照
+TAGS=("none-sleep200" "shared-sleep200" "none-sleep0")
+ARGS=("--affinity none --sleep-us 200"
+      "--affinity shared --sleep-us 200"
+      "--affinity none --sleep-us 0")
+\end{Verbatim}
+\end{yatpage}
+\newpage
+\begin{yatpage}
+\begin{Verbatim}[fontsize=\fontsize{8.2}{9.8}\selectfont]
+for idx in "${!TAGS[@]}"; do
+  tag="${TAGS[$idx]}"
+  mkdir -p "$OUT/$tag"
+  for i in $(seq 1 "$REPEATS"); do
+    echo "[$tag] run $i/$REPEATS"
+    # shellcheck disable=SC2086
+    "$SCRIPT" --tasks "$TASKS" --iters "$ITERS" --kernel "$KERNEL" \
+              --timeout "$TIMEOUT" ${ARGS[$idx]} > "$OUT/$tag/run-$i.log" 2>&1
+    rc=$?
+    if [[ $rc -ne 0 ]]; then
+      echo "  run failed rc=$rc (see $OUT/$tag/run-$i.log)" >&2
+      continue
+    fi
+    cp "$REPO/linux-6.8-main/yat_test_scripts/results/cfs_vs_yat.csv" "$OUT/$tag/run-$i.cs
+    v"
+    python3 - "$OUT/$tag/run-$i.csv" "$tag" "$i" >> "$ALL" <<'PY'
+import csv, sys
+path, tag, run = sys.argv[1], sys.argv[2], sys.argv[3]
+rows = {r["policy"]: r for r in csv.DictReader(open(path))}
+if "cfs" not in rows or "yat" not in rows:
+    sys.exit(0)
+c, y = rows["cfs"], rows["yat"]
+ratio = float(y["sum_wall_ns"]) / float(c["sum_wall_ns"])
+for name in ("cfs", "yat"):
+    r = rows[name]
+    print("%s,%s,%s,%s,%s,%s,%s,%s" % (tag, run, name, r["sum_wall_ns"],
+          r["sum_work_units"], r["vol_ctx"], r["invol_ctx"],
+          ("%.4f" % ratio) if name == "yat" else ""))
+PY
+  done
+done
+python3 - "$ALL" "$OUT/SUMMARY.txt" <<'PY'
+import csv, sys, statistics as st
+rows = list(csv.DictReader(open(sys.argv[1])))
+tags = []
+for r in rows:
+    if r["tag"] not in tags:
+        tags.append(r["tag"])
+out = []
+out.append("%-16s %6s %10s %10s %10s" % ("config", "n", "median", "min", "max"))
+for t in tags:
+    vals = [float(r["ratio_yat_over_cfs"]) for r in rows if r["tag"] == t and r["ratio_yat
+    _over_cfs"]]
+    if not vals:
+        continue
+    out.append("%-16s %6d %10.3f %10.3f %10.3f" % (t, len(vals), st.median(vals), min(vals
+    ), max(vals)))
+open(sys.argv[2], "w").write("\n".join(out) + "\n")
+print("\n".join(out))
+PY
+/* ==================== 文件：scripts/check_numbers.py ==================== */
+#!/usr/bin/env python3
+"""check_numbers.py —— 论文/README/SUMMARY 的数字与归档数据一致性校验
+只做一件事：把"文档里写的数"与"归档里的数"逐项对齐，不一致就失败。
+它不复算物理量，只复算**聚合**（median/min/max）与**派生百分比**——
+\end{Verbatim}
+\end{yatpage}
+\newpage
+\begin{yatpage}
+\begin{Verbatim}[fontsize=\fontsize{8.2}{9.8}\selectfont]
+这两步恰好是人工抄写最容易出错、又最容易验证的地方。
+两个数据目录，含义不同：
+  docs/validation/2026-11-13/kernel/repeat/        优化前（镜像 #19）
+  docs/validation/2026-11-13/kernel/repeat-routeA/ 当前实现（镜像 #20，Route A）
+被校验对象：
+  两个目录的 SUMMARY.txt（必须等于各自 all.csv 的复算结果）
+  report/paper/chapter6-test.tex（tab:cost / tab:routea / tab:counters / 正文）
+  report/paper/abstract.tex、chapter8-conclusion.tex
+  README.md、docs/validation/2026-11-13/SUMMARY.md
+退出码：0 全部一致；1 有不一致。
+"""
+import csv
+import io
+import os
+import re
+import statistics as st
+import sys
+ROOT = __file__.rsplit("/scripts/", 1)[0]
+BASE = ROOT + "/docs/validation/2026-11-13/kernel"
+HIST = BASE + "/repeat"
+MAIN = BASE + "/repeat-routeA"
+errors = []
+checks = 0
+def need(haystack, needle, where):
+    global checks
+    checks += 1
+    if needle not in haystack:
+        errors.append("%s: 缺少 %r" % (where, needle))
+def read(path):
+    return io.open(path, encoding="utf-8").read()
+def recompute(dir_path):
+    rows = list(csv.DictReader(io.open(dir_path + "/all.csv", encoding="utf-8")))
+    acc = {}
+    for r in rows:
+        if r["ratio_yat_over_cfs"]:
+            acc.setdefault(r["tag"], []).append(float(r["ratio_yat_over_cfs"]))
+    return {k: (st.median(v), min(v), max(v)) for k, v in acc.items() if len(v) >= 2}
+def check_summary(dir_path, label):
+    summary = read(dir_path + "/SUMMARY.txt")
+    exp = recompute(dir_path)
+    for tag, (med, lo, hi) in exp.items():
+        row = [l for l in summary.splitlines() if l.startswith(tag)]
+        if not row:
+            errors.append("%s/SUMMARY.txt 缺少配置 %s" % (label, tag))
+            continue
+        got = tuple(float(x) for x in row[0].split()[2:5])
+        for name, a, b in (("median", got[0], med), ("min", got[1], lo), ("max", got[2], h
+    i)):
+            global checks
+            checks += 1
+            if abs(a - b) > 5e-4:
+                errors.append("%s/SUMMARY.txt %s %s: 表内 %.3f, 复算 %.3f"
+                              % (label, tag, name, a, b))
+    return exp
+hist = check_summary(HIST, "repeat")
+\end{Verbatim}
+\end{yatpage}
+\newpage
+\begin{yatpage}
+\begin{Verbatim}[fontsize=\fontsize{8.2}{9.8}\selectfont]
+main = check_summary(MAIN, "repeat-routeA")
+for d, name in ((main, "repeat-routeA"), (hist, "repeat")):
+    if set(d) != {"none-sleep200", "shared-sleep200", "none-sleep0"}:
+        errors.append("%s/all.csv 的配置集不符合预期: %s" % (name, sorted(d)))
+# ---------------------------------------------------------------- 论文
+tex6 = read(ROOT + "/report/paper/chapter6-test.tex")
+tex_abs = read(ROOT + "/report/paper/abstract.tex")
+tex8 = read(ROOT + "/report/paper/chapter8-conclusion.tex")
+readme = read(ROOT + "/README.md")
+summary_md = read(ROOT + "/docs/validation/2026-11-13/SUMMARY.md")
+docs_all = tex6 + tex_abs + tex8
+# tab:cost 三行 = 当前实现（MAIN）
+cost = tex6[tex6.index(r"\label{tab:cost}"):tex6.index(r"\end{tabular}", tex6.index(r"\lab
+    el{tab:cost}"))]
+for tag, (med, lo, hi) in main.items():
+    for v in (med, lo, hi):
+        need(cost, "%.2f" % v, "chapter6 tab:cost")
+# tab:routea：改前 / 改后中位数都要出现
+for v in (hist["none-sleep200"][0], main["none-sleep200"][0]):
+    need(tex6, "%.2f" % v, "chapter6 tab:routea")
+need(tex6, "-9.5\\%", "chapter6 Route A 变化")
+# ---------------------------------------------------------------- 计数器
+log = read(MAIN + "/none-sleep200/run-1.log")
+counters = {}
+for line in log.splitlines():
+    m = re.match(r"\s+([a-z_0-9]+)\s+(\d+)\s*$", line)
+    if m:
+        counters[m.group(1)] = int(m.group(2))
+want = ["ttwu_ok", "select_calls", "select_sticky_idle", "select_decided",
+        "jobs_placed", "place_hit", "place_pending", "enq_calls",
+        "enq_cpus_allowed", "balance_runs", "balance_noop", "pick_calls"]
+for k in want:
+    checks += 1
+    if k not in counters:
+        errors.append("run-1.log 缺少计数器 %s" % k)
+        continue
+    need(tex6, str(counters[k]), "chapter6 计数器 %s" % k)
+sel, ttwu = counters["select_calls"], counters["ttwu_ok"]
+sticky, hit, pending = counters["select_sticky_idle"], counters["place_hit"], counters["pl
+    ace_pending"]
+for txt in ("%.1f" % (100.0 * sel / ttwu),
+            "%.1f" % (100.0 * sticky / sel),
+            "%.1f" % (100.0 * hit / (hit + pending))):
+    need(docs_all, txt + r"\%", "论文派生百分比 %s%%" % txt)
+# ---------------------------------------------------------------- README
+need(readme, "%.2f×" % main["none-sleep200"][0], "README 主口径")
+need(readme, "[%.2f, %.2f]" % main["none-sleep200"][1:], "README 主口径全距")
+need(readme, "%.2f×" % main["shared-sleep200"][0], "README shared")
+need(readme, "%.2f×" % main["none-sleep0"][0], "README 无唤醒")
+need(readme, "%d 次唤醒触发 %d 次选核" % (ttwu, sel), "README 计数器")
+need(readme, "%d/%d = %.1f%%" % (hit, hit + pending, 100.0 * hit / (hit + pending)), "READ
+    ME 接管率")
+# ---------------------------------------------------------------- SUMMARY.md
+need(summary_md, "%.3f" % main["none-sleep200"][0], "SUMMARY.md 主口径中位数")
+need(summary_md, "%.3f" % hist["none-sleep200"][0], "SUMMARY.md 优化前中位数")
+\end{Verbatim}
+\end{yatpage}
+\newpage
+\begin{yatpage}
+\begin{Verbatim}[fontsize=\fontsize{8.2}{9.8}\selectfont]
+need(summary_md, "%d" % counters["balance_runs"], "SUMMARY.md balance_runs")
+if errors:
+    print("❌ 数字一致性检查失败（%d 项）:" % len(errors))
+    for e in errors:
+        print("   - " + e)
+    sys.exit(1)
+print("✅ 数字一致性检查通过：%d 项比对" % checks)
+print("   仿真器数据不在校验范围（前期工作，非证据链）")
+for label, d in (("优化前 #19", hist), ("当前 #20", main)):
+    print("   %-10s %-16s median %.3f  [%.3f, %.3f]"
+          % (label, "none-sleep200", d["none-sleep200"][0], d["none-sleep200"][1], d["none
+    -sleep200"][2]))
+/* ==================== 文件：scripts/check_names.py ==================== */
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
+"""项目名拼写一致性检查（`make name-check`）。
+问题背景
+--------
+仓库里历史上出现过 6 种项目名写法：
+    Yat-CAShed    Yat_CAShed    Yat_Casched      name-check:ignore
+    Yat-CASCHED   Yat_CAshed    yat_CAShed       name-check:ignore
+散文层混用不会让程序出错，所以一直没人修；但它会让人分不清
+"这是同一个项目还是两个"，也让搜索失效（搜 `Yat-CAShed` 漏掉一半）。
+规范名
+------
+`Yat-CAShed`（Yet Another Task CAShed / Cache-Aware Scheduler）。
+判定依据不是"哪个出现得多"，而是**哪一个与外部不可变标识绑定**：
+  * git remote         git@github.com:donotcryok/Yat-CAShed.git
+  * CI badge URL       github.com/mafuquan/Yat-CAShed/actions/...
+  * 论文标题           \\title{Yat-CAShed: ...}（report/原理.tex）
+  * 仓库根目录名       Yat-CAShed/
+这三种外部引用（URL / 已发布的论文标题 / 目录名）一旦改动就断链或失真，
+因此它们决定了规范名的唯一合理取值。`Yat-Casched` 只出现在本仓库自己写的  name-check:ignor
+    e
+约定文字里，没有外部绑定，属于"可以改"的一方。  name-check:ignore
+哪些地方**不**检查
+------------------
+1. `docs/archive/`：归档文档是**历史快照**，正文必须保持原样，
+   改了就不再是"当时那份文档"了。归档前的名字在归档 README 中登记。
+2. `report/`：论文、报告、参考材料与早期草稿。这些是**交付物/写作素材**，
+   其中的写法应当随论文定稿统一，而不是被工程门禁反向约束。
+   （论文标题本身就用 `Yat-CAShed`，与规范名一致。）
+3. `patches/`：由 `scripts/gen_kernel_patches.sh` 生成，属于产物；
+   其内容随源文件生成，检查它没有意义，重生成即可。
+4. 二进制与压缩产物：`.pdf` `.pptx` `.docx` `.jar` `.png` 等。
+5. `linux-6.8-main/` 下的**上游内核源码**：我们不改上游文件的措辞。
+   只检查我们自己新增的 yat_* 文件与测试目录。
+白名单（行级）
+--------------
+以下情形**不算违规**，因为其中的写法是被引用的字面量，不是叙述：
+  * 出现在 URL 里（`github.com/.../Yat-CAShed`）；
+  * 出现在**已存在的文件名**里（`Yat-CAShed.tex`、`Yat-CAShed.pdf`、
+    `yat_CAshed.pdf`）；
+  * 该行含显式标记 `name-check:ignore`。用于「必须列出错误写法才说得清」的
+    规则说明行——例如 `CONTRIBUTING.md` §6 的命名规则。**这是逃生舱，不是常规手段**：
+\end{Verbatim}
+\end{yatpage}
+\newpage
+\begin{yatpage}
+\begin{Verbatim}[fontsize=\fontsize{8.2}{9.8}\selectfont]
+    每次使用都应能在 code review 中解释得清，否则就是真的违规。
+退出码
+------
+0 = 全部合规；1 = 发现违规（逐条打印 `文件:行: 违规写法  ->  上下文`）。
+"""
+from __future__ import annotations
+import re
+import subprocess
+import sys
+from pathlib import Path
+# 规范名
+CANONICAL = "Yat-CAShed"
+# 需要规整的写法（规范名本身不在其中）。
+#
+# 本元组必须逐字写出每一种错误拼法，否则检查器认不出它们 —— 这些
+# 字面量本身就是「规则的定义」，不是需要被规整的散文。因此整块加
+# 行级豁免标记：这是 `LINE_ALLOW_SUBSTRINGS` 里 `name-check:ignore`
+# 被设计出来的场景（与 CONTRIBUTING.md §6 的命名规则表同理）。
+VARIANTS = (  # name-check:ignore
+    "Yat_CAShed",       # name-check:ignore
+    "Yat_Casched",      # name-check:ignore
+    "Yat-CASCHED",      # name-check:ignore
+    "Yat_CAshed",       # name-check:ignore
+    "yat_CAShed",       # name-check:ignore
+    "Yat-Casched",      # name-check:ignore
+    "YAT_CASHED",       # name-check:ignore
+)
+VARIANT_RE = re.compile("|".join(re.escape(v) for v in VARIANTS))
+# 整目录豁免
+EXEMPT_DIRS = (
+    "docs/archive/",
+    "report/",
+    "patches/",
+    ".git/",
+)
+# 归档的第三方/历史**原始件**（补丁、日志、CSV）按原样保存，不改写其中字面量
+EXEMPT_SUFFIXES_UNDER = (
+    ("docs/validation/", ".patch"),
+    ("docs/validation/", ".csv"),
+    ("docs/validation/", ".log"),
+)
+# `linux-6.8-main/` 下只查我们自己新增的东西（其余是上游源码）
+KERNEL_ALLOW_PREFIXES = (
+    "linux-6.8-main/boot_test_scripts/",
+    "linux-6.8-main/yat_test_scripts/",
+    "linux-6.8-main/test_visualization/",
+)
+KERNEL_ALLOW_FILES = (
+    "linux-6.8-main/kernel/sched/yat_casched.c",
+    "linux-6.8-main/include/linux/sched/yat_casched.h",
+    "linux-6.8-main/include/trace/events/yat_casched.h",
+    "linux-6.8-main/yat_casched优化记录.md",
+)
+BINARY_EXT = {
+    ".pdf", ".pptx", ".docx", ".jar", ".png", ".jpg", ".jpeg", ".gif",
+\end{Verbatim}
+\end{yatpage}
+\newpage
+\begin{yatpage}
+\begin{Verbatim}[fontsize=\fontsize{8.2}{9.8}\selectfont]
+    ".ico", ".zip", ".gz", ".xz", ".bz2", ".o", ".a", ".so", ".bin",
+}
+# 行级白名单：出现这些子串的行豁免
+LINE_ALLOW_SUBSTRINGS = (
+    "github.com/",          # URL 里的是仓库名，不可改
+    "Yat-CAShed.tex",       # 已存在的论文主文件名
+    "Yat-CAShed.pdf",       # 已存在的产物名
+    "yat_CAshed.pdf",       # 历史产物名
+    "Yat-CAShed_new.tex",   # 已删除文件的记录（CHANGELOG 历史条目）
+    "name-check:ignore",    # 显式行级豁免（用于必须列举错误写法的规则说明）
+)
+def tracked_files() -> list[str]:
+    out = subprocess.run(
+        ["git", "ls-files", "-z"], capture_output=True, check=True
+    ).stdout
+    return [p for p in out.decode("utf-8", "replace").split("\0") if p]
+def in_scope(path: str) -> bool:
+    if any(path.startswith(d) for d in EXEMPT_DIRS):
+        return False
+    if Path(path).suffix.lower() in BINARY_EXT:
+        return False
+    for prefix, suffix in EXEMPT_SUFFIXES_UNDER:
+        if path.startswith(prefix) and path.endswith(suffix):
+            return False
+    if path.startswith("linux-6.8-main/"):
+        if path in KERNEL_ALLOW_FILES:
+            return True
+        return any(path.startswith(p) for p in KERNEL_ALLOW_PREFIXES)
+    return True
+def main() -> int:
+    violations: list[tuple[str, int, str, str]] = []
+    scanned = 0
+    for rel in tracked_files():
+        if not in_scope(rel):
+            continue
+        p = Path(rel)
+        if not p.is_file():
+            continue
+        try:
+            text = p.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            continue
+        scanned += 1
+        for lineno, line in enumerate(text.splitlines(), 1):
+            if not VARIANT_RE.search(line):
+                continue
+            if any(s in line for s in LINE_ALLOW_SUBSTRINGS):
+                continue
+            for m in VARIANT_RE.finditer(line):
+                violations.append((rel, lineno, m.group(0), line.strip()))
+    print(f"name-check: 扫描 {scanned} 个文件，规范名 = {CANONICAL}")
+    if not violations:
+        print("✅ 项目名拼写一致（散文层无残留变体）")
+        return 0
+    by_variant: dict[str, int] = {}
+\end{Verbatim}
+\end{yatpage}
+\newpage
+\begin{yatpage}
+\begin{Verbatim}[fontsize=\fontsize{8.2}{9.8}\selectfont]
+    for _, _, v, _ in violations:
+        by_variant[v] = by_variant.get(v, 0) + 1
+    print(f"❌ 发现 {len(violations)} 处不一致：")
+    for v, n in sorted(by_variant.items(), key=lambda kv: -kv[1]):
+        print(f"   {n:4d}  {v}")
+    print()
+    for rel, lineno, v, ctx in violations:
+        print(f"  {rel}:{lineno}: {v}  ->  {ctx[:140]}")
+    print()
+    print(f"修法：把上表中的写法改为 `{CANONICAL}`。")
+    print("以下情形可豁免（请勿为此修改门禁，而是确认是否真的该改）：")
+    print("  * 指向已存在文件/URL 的字面量（如 Yat-CAShed.tex）—— 文件名不是散文；")
+    print("  * docs/archive/ 下的历史文档正文 —— 归档件保持原样。")
+    return 1
+if __name__ == "__main__":
+    sys.exit(main())
+/* ==================== 文件：scripts/check_docs.py ==================== */
+#!/usr/bin/env python3
+"""检查 Markdown 文档中的相对链接是否指向真实存在的文件。
+设计原则：
+- 只检查「本项目自己维护」的文档，避免扫描整棵 linux-6.8-main 内核树（数万文件）。
+- 忽略外链（http/https/mailto）、纯锚点（#xxx）以及代码块内的示例链接。
+- 链接目标允许携带 `#anchor`，但锚点本身不做校验（Markdown 锚点规则因渲染器而异）。
+- 退出码：0 = 全部有效；1 = 存在失效链接。
+归档文档的链接基准
+------------------
+`docs/archive/` 下的文档是**历史快照**，正文必须保持原样（不修改、不回填），
+但它们内部的相对链接是以**归档前的原始位置**为基准写的。直接把归档件按新位置
+解析会产生假阳性——链接本身没错，是基准变了。
+因此这里不"跳过"归档件，而是用 `LINK_BASE_OVERRIDES` 把基准换回原目录：
+链接仍然照常校验（目标若真的被删了依然会报错），只是解析起点变了。
+原路径与基准的对应关系同时登记在 `docs/archive/README.md` 中，两处保持一致。
+"""
+from __future__ import annotations
+import os
+import re
+import sys
+from pathlib import Path
+from urllib.parse import unquote
+ROOT = Path(__file__).resolve().parent.parent
+# 本项目自己维护的 Markdown 范围（相对仓库根目录）
+EXPLICIT_GLOBS = [
+    "*.md",
+    "docs/**/*.md",
+    "report/**/*.md",
+    "simulator/**/*.md",
+    "linux-6.8-main/*.md",
+    "linux-6.8-main/boot_test_scripts/*.md",
+    "linux-6.8-main/yat_test_scripts/*.md",
+    "linux-6.8-main/test_visualization/*.md",
+]
+# 生成物/依赖目录，直接跳过
+SKIP_DIRS = {".git", "classes", "out", "result", "node_modules", "__pycache__", ".venv"}
+# 归档件的链接基准覆盖：归档文件（相对仓库根） -> 归档前所在的目录（相对仓库根）
+# 归档正文不回填，因此按原目录解析才反映"当时这些链接指向哪里"。
+\end{Verbatim}
+\end{yatpage}
+\newpage
+\begin{yatpage}
+\begin{Verbatim}[fontsize=\fontsize{8.2}{9.8}\selectfont]
+LINK_BASE_OVERRIDES = {
+    "docs/archive/Yat-CAShed-初赛版实现文档.md": "linux-6.8-main",
+    "docs/archive/Yat-CAShed-决赛版实现文档.md": "report/paper",
+}
+# 归档件开头有一段**新增的**归档 banner（不是原文），它的链接是按新位置写的。
+# 该标记之后才切换到"原目录"基准。标记前的行一律按文件实际位置解析。
+ARCHIVE_BANNER_END = "<!-- /archive-banner -->"
+LINK_RE = re.compile(r"!?\[[^\]]*\]\(\s*(<[^>]+>|[^)\s]+)(?:\s+['\"][^'\"]*['\"])?\s*\)")
+FENCE_RE = re.compile(r"^```|^~~~")
+INLINE_CODE_RE = re.compile(r"`[^`]*`")
+IGNORED_PREFIXES = ("http://", "https://", "mailto:", "tel:", "ftp://", "#", "data:")
+def iter_markdown_files() -> list[Path]:
+    seen: set[Path] = set()
+    files: list[Path] = []
+    for pattern in EXPLICIT_GLOBS:
+        for path in sorted(ROOT.glob(pattern)):
+            if not path.is_file() or path.suffix.lower() != ".md":
+                continue
+            if any(part in SKIP_DIRS for part in path.relative_to(ROOT).parts):
+                continue
+            if path not in seen:
+                seen.add(path)
+                files.append(path)
+    return files
+def strip_code_blocks(lines: list[str]) -> list[tuple[int, str]]:
+    """去掉围栏代码块，返回 (行号, 内容) 列表。"""
+    result: list[tuple[int, str]] = []
+    in_fence = False
+    for lineno, line in enumerate(lines, start=1):
+        if FENCE_RE.match(line.strip()):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        result.append((lineno, INLINE_CODE_RE.sub("", line)))
+    return result
+def link_bases(md_file: Path, lines: list[str]) -> tuple[Path, Path, int]:
+    """返回 (banner 基准, 正文基准, 切换行号)。
+    非归档件两者相同、切换行号为 0（永不切换）。
+    归档件的 banner 用文件当前位置，正文用归档前目录；
+    若文件里没有 banner 结束标记，则全文按归档前目录解析。
+    """
+    own = md_file.parent
+    rel = md_file.relative_to(ROOT).as_posix()
+    override = LINK_BASE_OVERRIDES.get(rel)
+    if not override:
+        return own, own, 0
+    archive_base = (ROOT / override).resolve()
+    for idx, line in enumerate(lines, start=1):
+        if ARCHIVE_BANNER_END in line:
+            return own, archive_base, idx
+    return archive_base, archive_base, 0
+def check_file(md_file: Path) -> list[tuple[int, str, str]]:
+    """返回 [(行号, 原始目标, 解析后的路径)]，仅包含失效项。"""
+    try:
+\end{Verbatim}
+\end{yatpage}
+\newpage
+\begin{yatpage}
+\begin{Verbatim}[fontsize=\fontsize{8.2}{9.8}\selectfont]
+        text = md_file.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:  # pragma: no cover - 防御性
+        return [(0, str(md_file), f"读取失败: {exc}")]
+    raw_lines = text.splitlines()
+    banner_base, body_base, switch_at = link_bases(md_file, raw_lines)
+    broken: list[tuple[int, str, str]] = []
+    for lineno, line in strip_code_blocks(raw_lines):
+        base = banner_base if (switch_at and lineno <= switch_at) else body_base
+        for match in LINK_RE.finditer(line):
+            target = match.group(1).strip()
+            if target.startswith("<") and target.endswith(">"):
+                target = target[1:-1].strip()
+            if not target or target.startswith(IGNORED_PREFIXES):
+                continue
+            # 去掉锚点与查询串
+            clean = target.split("#", 1)[0].split("?", 1)[0]
+            if not clean:
+                continue
+            clean = unquote(clean)
+            if clean.startswith("/"):
+                continue  # 站点绝对路径，不适用于仓库内相对校验
+            resolved = (base / clean).resolve()
+            if not resolved.exists():
+                broken.append((lineno, target, clean))
+    return broken
+def main() -> int:
+    files = iter_markdown_files()
+    if not files:
+        print("未找到任何待检查的 Markdown 文件。")
+        return 1
+    total_links = 0
+    total_broken = 0
+    for md_file in files:
+        broken = check_file(md_file)
+        if broken:
+            rel = md_file.relative_to(ROOT)
+            for lineno, raw, clean in broken:
+                print(f"{rel}:{lineno}: 失效链接 -> {raw}")
+                total_broken += 1
+    # 统计链接数仅用于提示（不重复解析，做轻量估算）
+    for md_file in files:
+        try:
+            text = md_file.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for _, line in strip_code_blocks(text.splitlines()):
+            for match in LINK_RE.finditer(line):
+                target = match.group(1).strip().strip("<>")
+                if target and not target.startswith(IGNORED_PREFIXES):
+                    total_links += 1
+    print(f"\n检查完成：{len(files)} 个 Markdown 文件，{total_links} 条链接，失效 {total_b
+    roken} 条。")
+    return 1 if total_broken else 0
+if __name__ == "__main__":
+    sys.exit(main())
+\end{Verbatim}
+\end{yatpage}
+\end{document}

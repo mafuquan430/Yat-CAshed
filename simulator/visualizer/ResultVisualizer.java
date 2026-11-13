@@ -3,6 +3,9 @@ package visualizer;
 import java.io.File;
 import java.io.FileWriter;
 import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.nio.charset.StandardCharsets;
+import java.util.Locale;
 import java.text.DecimalFormat;
 import java.util.List;
 import java.util.Map;
@@ -229,12 +232,12 @@ public class ResultVisualizer {
             }
             
             // 写入CSV文件，包含执行时间数据
-            try (FileWriter writer = new FileWriter(filename)) {
+            try (FileWriter writer = new FileWriter(filename, StandardCharsets.UTF_8)) {
                 writer.write(String.join(",", CSV_COLUMNS));
                 writer.write('\n');
                 for (String algorithm : algorithmResults.keySet()) {
                     for (ExperimentResult result : algorithmResults.get(algorithm)) {
-                        writer.write(String.format(CSV_FORMAT,
+                        writer.write(String.format(Locale.ROOT, CSV_FORMAT,
                             algorithm,
                             result.testCaseId,
                             result.makespan,
@@ -246,11 +249,12 @@ public class ResultVisualizer {
                             result.loadBalance));
                     }
                 }
-                System.out.println("✅ CSV数据已导出到: " + filename);
+
             }
             writeMetadataSidecar(filename, algorithmResults);
+            System.out.println("✅ CSV及元数据已导出到: " + filename);
         } catch (IOException e) {
-            System.err.println("❌ CSV导出失败: " + e.getMessage());
+            throw new UncheckedIOException("CSV export failed: " + filename, e);
         }
     }
     /**
@@ -264,7 +268,7 @@ public class ResultVisualizer {
      * schema 版本、列名、算法集合、行数。它<b>不</b>记录实验参数——
      * 参数属于 {@code config/*.yaml}，重复记录会造成两处事实互相矛盾。
      *
-     * <p>失败不致命：CSV 已经写好，旁文件只影响可追溯性，因此这里把异常降级为警告。
+     * <p>CSV 与元数据均为必需产物；任一写入失败均传播到调用方。
      */
     private void writeMetadataSidecar(String csvFilename,
                                       Map<String, List<ExperimentResult>> algorithmResults) {
@@ -301,11 +305,11 @@ public class ResultVisualizer {
         sb.append("  \"note\": \"实验参数见 config/*.yaml；本文件只描述 CSV 结构\"\n");
         sb.append("}\n");
 
-        try (FileWriter w = new FileWriter(metaName)) {
+        try (FileWriter w = new FileWriter(metaName, StandardCharsets.UTF_8)) {
             w.write(sb.toString());
             System.out.println("🧾 元数据旁文件已导出到: " + metaName);
         } catch (IOException e) {
-            System.err.println("⚠️  元数据旁文件写入失败（CSV 本身已正常）: " + e.getMessage());
+            throw new UncheckedIOException("Metadata export failed: " + metaName, e);
         }
     }
 

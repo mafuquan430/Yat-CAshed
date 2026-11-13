@@ -48,6 +48,7 @@ NEW_FILES=(
   kernel/sched/yat_casched.c
   boot_test_scripts/README.md
   boot_test_scripts/SIMPLE_TEST_README.md
+  boot_test_scripts/yat_affinity_test.c
   boot_test_scripts/yat_bench.c
   boot_test_scripts/yat_simple_test.c
   yat_test_scripts/README.md
@@ -166,6 +167,7 @@ make_patch 0005-test-env.patch \
   "test: add Yat QEMU boot/test environments and CFS-vs-Yat benchmark" \
   N:boot_test_scripts/README.md \
   N:boot_test_scripts/SIMPLE_TEST_README.md \
+  N:boot_test_scripts/yat_affinity_test.c \
   N:boot_test_scripts/yat_bench.c \
   N:boot_test_scripts/yat_simple_test.c \
   N:yat_test_scripts/README.md \

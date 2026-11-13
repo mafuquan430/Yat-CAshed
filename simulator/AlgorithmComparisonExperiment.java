@@ -1,3 +1,4 @@
+import analyzer.ConfidenceInterval;
 import java.io.File;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -8,8 +9,10 @@ import java.util.List;
 import java.util.Map;
 import java.util.Random;
 
-import allocation.WFD;
+import allocation.AllocationMethods;
 import allocation.CacheAware_v2;
+import allocation.CacheAware_v3;
+import allocation.WFD;
 import analyzer.PerformanceAnalyzer;
 import analyzer.PerformanceAnalyzer.ExperimentResult;
 import entity.Node;
@@ -103,6 +106,40 @@ public class AlgorithmComparisonExperiment {
      */
     private static double HIGH_CACHE_SENSITIVITY_RATIO =
             ExperimentConfig.DEFAULT_HIGH_CACHE_SENSITIVITY_RATIO;
+
+    // ==================== 挑战者分配器（--allocator=） ====================
+    //
+    // 主实验原本只跑 CacheAware_v2。要把 CacheAware_v3（AJLR-lite）纳入同一套
+    // 统计与门禁，就只能换"挑战者"，不能换基线：WFD 与 SharedCacheModel 一行不动，
+    // 这样两代挑战者的数字才可以直接对比。
+    //
+    //   --allocator=v2 （默认）历史实现，行为与 2026-11 之前逐位一致；
+    //   --allocator=v3  AJLR-lite：命中历史 + 负载窗口，参数见 --policy/--alpha/--premium。
+
+    /** 挑战者标识：v2（默认）或 v3。 */
+    private static String ALLOCATOR = "v2";
+
+    /** 挑战者在 CSV 的 Algorithm 列与报告里的名字（跟随 ALLOCATOR，不写死）。 */
+    private static String CHALLENGER_NAME = "CacheAware_v2";
+
+    /** v3 判定规则：MIN_FINISH 或 HEAD_ROOM（仅 --allocator=v3 生效）。 */
+    private static String V3_POLICY = "HEAD_ROOM";
+
+    /** v3 负载窗口 α（仅 --allocator=v3 生效）。 */
+    private static double V3_ALPHA = 0.5;
+
+    /** v3 的 CRP 溢价缩放（1.0 = 与模型一致；仅 --allocator=v3 生效）。 */
+    private static double V3_PREMIUM = 1.0;
+
+    /**
+     * 是否沿用"WFD 静态负载跨用例不清零"的旧口径。
+     *
+     * <p>默认关闭（每个用例前 {@code WFD.resetLoads()}）。开着它，100 个用例会继承
+     * 前 99 个用例累积的负载偏置，而挑战者每用例都复位——这正是 2026-11 复核定位到
+     * 的基线占便宜（见 docs/validation/2026-11-13/SUMMARY.md）。保留开关只是为了让
+     * 2026-10-24 归档的 −0.954% 仍能逐字节复现。
+     */
+    private static boolean LEGACY_WFD_STATE = false;
     
     /** 性能分析器实例 */
     private static PerformanceAnalyzer analyzer;
@@ -132,6 +169,13 @@ public class AlgorithmComparisonExperiment {
         System.out.println("  --tasks=N         每案例任务数");
         System.out.println("  --seed=N          单随机种子");
         System.out.println("  --seeds=a,b,c     多随机种子；也可写 --seeds=K 表示 1..K");
+        System.out.println();
+        System.out.println("挑战者分配器（只换挑战者，不换基线）:");
+        System.out.println("  --allocator=v2|v3 挑战者，默认 v2（历史实现）；v3 = AJLR-lite");
+        System.out.println("  --policy=NAME     v3 的判定规则：HEAD_ROOM（默认）或 MIN_FINISH");
+        System.out.println("  --alpha=R         v3 的负载窗口，默认 0.5；0=只在最轻核里按命中挑");
+        System.out.println("  --premium=R       v3 的 CRP 溢价缩放，默认 1.0（用于误差敏感性）");
+        System.out.println("  --legacy-wfd-state 沿用 WFD 负载跨用例不清零的旧口径（复现归档数字用）");
         System.out.println();
         System.out.println("度量与输出:");
         System.out.println("  --legacy-metrics  使用旧的（不公平）口径复现历史结果");
@@ -183,19 +227,30 @@ public class AlgorithmComparisonExperiment {
                 } else if (arg.equals("--no-viz")) {
                     ENABLE_VIZ = false;
                     CONFIG.overrideEnableViz(false);
+                } else if (arg.startsWith("--allocator=")) {
+                    ALLOCATOR = arg.substring("--allocator=".length()).trim();
+                } else if (arg.startsWith("--policy=")) {
+                    V3_POLICY = arg.substring("--policy=".length()).trim()
+                            .toUpperCase(java.util.Locale.ROOT);
+                } else if (arg.startsWith("--alpha=")) {
+                    V3_ALPHA = Double.parseDouble(arg.substring("--alpha=".length()));
+                } else if (arg.startsWith("--premium=")) {
+                    V3_PREMIUM = Double.parseDouble(arg.substring("--premium=".length()));
+                } else if (arg.equals("--legacy-wfd-state")) {
+                    LEGACY_WFD_STATE = true;
                 } else if (arg.equals("--legacy-metrics")) {
                     LEGACY_METRICS = true;
                     CONFIG.overrideLegacyMetrics(true);
                 } else if (arg.equals("--print-config")) {
                     printConfig = true;
                 } else if (arg.startsWith("--cores=")) {
-                    CORES = Math.max(1, Integer.parseInt(arg.substring(8)));
+                    CORES = Integer.parseInt(arg.substring(8));
                     CONFIG.overrideCores(CORES);
                 } else if (arg.startsWith("--cases=")) {
-                    TOTAL_TEST_CASES = Math.max(1, Integer.parseInt(arg.substring(8)));
+                    TOTAL_TEST_CASES = Integer.parseInt(arg.substring(8));
                     CONFIG.overrideTotalTestCases(TOTAL_TEST_CASES);
                 } else if (arg.startsWith("--tasks=")) {
-                    TASKS_PER_CASE = Math.max(1, Integer.parseInt(arg.substring(8)));
+                    TASKS_PER_CASE = Integer.parseInt(arg.substring(8));
                     CONFIG.overrideTasksPerCase(TASKS_PER_CASE);
                 } else if (arg.startsWith("--seed=")) {
                     SEED = Long.parseLong(arg.substring(7));
@@ -204,13 +259,22 @@ public class AlgorithmComparisonExperiment {
                     SEEDS = parseSeeds(arg.substring(8));
                     CONFIG.overrideSeeds(SEEDS);
                 } else {
-                    System.out.println("⚠️  忽略未知参数: " + arg);
+                    System.err.println("Unknown argument: " + arg);
+                    System.exit(2);
                 }
             } catch (NumberFormatException e) {
                 System.err.println("❌ 参数格式错误: " + arg + "（应为 --key=整数）");
                 System.exit(2);
             }
         }
+        try {
+            CONFIG.validate();
+        } catch (ExperimentConfig.ConfigException e) {
+            System.err.println("Invalid effective configuration: " + e.getMessage());
+            System.exit(2);
+        }
+        applyConfigToFields();
+        applyAllocatorSelection();
         if (printConfig) {
             System.out.println("--- 最终生效配置 ---");
             System.out.println(CONFIG.describe());
@@ -238,6 +302,53 @@ public class AlgorithmComparisonExperiment {
     }
 
     /**
+     * 校验并落地挑战者选择。
+     *
+     * <p>两处硬约束，都是"宁可报错也不静默混口径"：
+     * <ul>
+     *   <li>{@code --legacy-metrics} 与 {@code --allocator=v3} 互斥：旧口径的执行时间
+     *       打折来自 {@code CacheAware_v2.calculateExecutionTime()}，v3 没有这个函数，
+     *       放行只会得到两种口径的混合物。</li>
+     *   <li>α 必须非负、premium 必须为正；越界直接退出，不夹到边界。</li>
+     * </ul>
+     */
+    private static void applyAllocatorSelection() {
+        if ("v2".equalsIgnoreCase(ALLOCATOR)) {
+            ALLOCATOR = "v2";
+            CHALLENGER_NAME = "CacheAware_v2";
+            return;
+        }
+        if (!"v3".equalsIgnoreCase(ALLOCATOR)) {
+            System.err.println("❌ --allocator 只接受 v2 或 v3，收到: " + ALLOCATOR);
+            System.exit(2);
+        }
+        if (!"MIN_FINISH".equals(V3_POLICY) && !"HEAD_ROOM".equals(V3_POLICY)) {
+            System.err.println("❌ --policy 只接受 MIN_FINISH 或 HEAD_ROOM，收到: " + V3_POLICY);
+            System.exit(2);
+        }
+        if (LEGACY_METRICS) {
+            System.err.println("❌ --legacy-metrics 不能与 --allocator=v3 同时使用：");
+            System.err.println("   旧口径的执行时间打折只存在于 CacheAware_v2，v3 没有对应实现。");
+            System.exit(2);
+        }
+        if (!(V3_ALPHA >= 0.0) || Double.isNaN(V3_ALPHA)) {
+            System.err.println("❌ --alpha 必须为非负数，收到: " + V3_ALPHA);
+            System.exit(2);
+        }
+        if (!(V3_PREMIUM > 0.0) || Double.isNaN(V3_PREMIUM)) {
+            System.err.println("❌ --premium 必须为正数，收到: " + V3_PREMIUM);
+            System.exit(2);
+        }
+        ALLOCATOR = "v3";
+        CHALLENGER_NAME = "CacheAware_v3";
+        CacheAware_v3.setPolicy(
+                "MIN_FINISH".equals(V3_POLICY) ? CacheAware_v3.Policy.MIN_FINISH
+                                               : CacheAware_v3.Policy.HEAD_ROOM,
+                V3_ALPHA);
+        CacheAware_v3.setPremiumScale(V3_PREMIUM);
+    }
+
+    /**
      * 解析 --seeds 参数。
      * <ul>
      *   <li>{@code --seeds=1,2,3} → 精确的三个种子</li>
@@ -246,9 +357,9 @@ public class AlgorithmComparisonExperiment {
      */
     private static long[] parseSeeds(String spec) {
         if (spec == null || spec.trim().isEmpty()) {
-            return null;
+            throw new NumberFormatException("Seed specification must not be empty");
         }
-        String[] parts = spec.split(",");
+        String[] parts = spec.split(",", -1);
         if (parts.length == 1 && !parts[0].contains("-")) {
             int count = Integer.parseInt(parts[0].trim());
             if (count <= 0) {
@@ -269,7 +380,7 @@ public class AlgorithmComparisonExperiment {
 
     public static void main(String[] args) {
         parseArgs(args);
-        System.out.println("=== WFD vs CacheAware_v2算法性能对比实验 ===");
+        System.out.println("=== WFD vs " + CHALLENGER_NAME + " 算法性能对比实验 ===");
         System.out.println("🎯 目标：在**统一执行/缓存模型**下对比两种放置策略（公平基线 C1）");
         System.out.println("📊 实验规模: " + TOTAL_TEST_CASES + " 个测试案例");
         System.out.println("💻 处理器核心数: " + CORES);
@@ -278,7 +389,15 @@ public class AlgorithmComparisonExperiment {
         System.out.println("📈 利用率级别: " + java.util.Arrays.toString(UTILIZATION_LEVELS));
         System.out.println("🧪 度量口径: " + (LEGACY_METRICS
                 ? "LEGACY（旧的不公平口径，仅用于对比）"
-                : "FAIR（WFD/CacheAware 共用 SharedCacheModel）"));
+                : "FAIR（WFD/" + CHALLENGER_NAME + " 共用 SharedCacheModel）"));
+        System.out.println("🧹 WFD 基线口径: " + (LEGACY_WFD_STATE
+                ? "LEGACY（静态负载跨用例不清零，仅用于复现归档）"
+                : "CLEAN（每用例复位 WFD 负载表）"));
+        System.out.println("🧩 挑战者分配器: " + CHALLENGER_NAME
+                + ("v3".equals(ALLOCATOR)
+                   ? String.format("（policy=%s, alpha=%.2f, premium=%.2f）",
+                                   CacheAware_v3.getPolicy(), V3_ALPHA, V3_PREMIUM)
+                   : ""));
         if (SEEDS != null) {
             System.out.println("🎲 随机种子: " + java.util.Arrays.toString(SEEDS));
         } else {
@@ -330,52 +449,8 @@ public class AlgorithmComparisonExperiment {
         System.out.println("=".repeat(80));
         printAggregate("Makespan 改进 (%)", makespanImp);
         printAggregate("缓存命中率提升 (百分点)", hitImp);
-        printAggregate("CacheAware 胜率 (%)", winRate);
+        printAggregate(CHALLENGER_NAME + " 胜率 (%)", winRate);
         System.out.println("=".repeat(80));
-    }
-
-    /**
-     * 95% 置信区间应使用的双侧临界值。
-     *
-     * <p>n 很小时用正态近似（1.96）会**低估**区间，从而把「不显著」误判为「显著」。
-     * n=5 时 t(0.975, 4) = 2.776，几乎是 1.96 的 1.42 倍。这里按自由度查表，
-     * 表中没有的较大自由度退回 1.96（此时 t 与正态差异 < 1%）。
-     */
-    private static double tCritical95(int n) {
-        int df = n - 1;
-        switch (df) {
-            case 1:  return 12.706;
-            case 2:  return 4.303;
-            case 3:  return 3.182;
-            case 4:  return 2.776;
-            case 5:  return 2.571;
-            case 6:  return 2.447;
-            case 7:  return 2.365;
-            case 8:  return 2.306;
-            case 9:  return 2.262;
-            case 10: return 2.228;
-            case 11: return 2.201;
-            case 12: return 2.179;
-            case 13: return 2.160;
-            case 14: return 2.145;
-            case 15: return 2.131;
-            case 16: return 2.120;
-            case 17: return 2.110;
-            case 18: return 2.101;
-            case 19: return 2.093;
-            case 20: return 2.086;
-            case 21: return 2.080;
-            case 22: return 2.074;
-            case 23: return 2.069;
-            case 24: return 2.064;
-            case 25: return 2.060;
-            case 26: return 2.056;
-            case 27: return 2.052;
-            case 28: return 2.048;
-            case 29: return 2.045;
-            case 30: return 2.042;
-            default: return 1.96;
-        }
     }
 
     /** 打印一组样本的均值、样本标准差与 95% 置信区间半宽。 */
@@ -395,11 +470,15 @@ public class AlgorithmComparisonExperiment {
             variance /= (n - 1);
         }
         double sd = Math.sqrt(variance);
-        double t = tCritical95(n);
-        double ci = n > 1 ? t * sd / Math.sqrt(n) : 0.0;
+        double t = n > 1 ? ConfidenceInterval.critical95(n) : Double.NaN;
+        double ci = ConfidenceInterval.halfWidth95(xs);
 
-        System.out.printf("   %-28s 均值=%8.3f  标准差=%7.3f  95%%CI=±%.3f  (n=%d, t=%.3f)%n",
-                label, mean, sd, ci, n, n > 1 ? t : Double.NaN);
+        if (n < 2) {
+            System.out.printf("   %s 均值=%.3f  标准差及95%%CI不可估计 (n=%d)%n", label, mean, n);
+        } else {
+            System.out.printf("   %-28s 均值=%8.3f  标准差=%7.3f  95%%CI=±%.3f  (n=%d, t=%.3f)%n",
+                    label, mean, sd, ci, n, t);
+        }
         System.out.print("      样本: [");
         for (int i = 0; i < n; i++) {
             System.out.printf("%s%.2f", i == 0 ? "" : ", ", xs[i]);
@@ -447,7 +526,7 @@ public class AlgorithmComparisonExperiment {
      */
     private static SeedSummary runComparison(long seed, boolean withViz) {
         SeedSummary summary = new SeedSummary();
-        System.out.println("🚀 开始WFD vs CacheAware_v2对比实验...\n");
+        System.out.println("🚀 开始 WFD vs " + CHALLENGER_NAME + " 对比实验...\n");
 
         // 旧口径下才允许 CacheAware 把自估命中率写回任务；公平基线永不写回。
         CacheAware_v2.setLegacyWriteBack(LEGACY_METRICS);
@@ -459,7 +538,7 @@ public class AlgorithmComparisonExperiment {
         // 存储各算法的实验结果
         Map<String, List<ExperimentResult>> algorithmResults = new HashMap<>();
         algorithmResults.put("WFD", new ArrayList<>());
-        algorithmResults.put("CacheAware_v2", new ArrayList<>());
+        algorithmResults.put(CHALLENGER_NAME, new ArrayList<>());
         
         // 性能统计变量
         int completedTests = 0;
@@ -490,6 +569,11 @@ public class AlgorithmComparisonExperiment {
                 );
                 
                 // === WFD算法测试 ===
+                // 每个用例前清空静态负载表：test case 之间相互独立，基线不该继承
+                // 前一个用例的负载（--legacy-wfd-state 可恢复旧口径以复现归档）。
+                if (!LEGACY_WFD_STATE) {
+                    WFD.resetLoads();
+                }
                 List<Node> wfdTasks = cloneTasks(originalTasks);
                 List<Integer> wfdProcessors = generateProcessorList(CORES);
                 WFD wfdAlgorithm = new WFD();
@@ -503,12 +587,14 @@ public class AlgorithmComparisonExperiment {
                 );
                 algorithmResults.get("WFD").add(wfdResult);
                 
-                // === CacheAware_v2算法测试 ===
+                // === 挑战者算法测试（v2 或 v3，见 --allocator=） ===
                 List<Node> cacheTasks = cloneTasks(originalTasks);
                 List<Integer> cacheProcessors = generateProcessorList(CORES);
-                CacheAware_v2 cacheAlgorithm = new CacheAware_v2();
+                // 每个用例新建实例：v3 的命中历史必须随用例清零，否则就是本轮在
+                // WFD 静态负载表上发现的那类状态泄漏（docs/validation/2026-11-13）。
+                AllocationMethods cacheAlgorithm = newChallenger();
                 
-                // 重置缓存状态
+                // 重置缓存状态（v2 的静态状态；v3 由新实例保证）
                 CacheAware_v2.resetState();
                 
                 long cacheStartTime = System.nanoTime();
@@ -516,10 +602,10 @@ public class AlgorithmComparisonExperiment {
                 long cacheEndTime = System.nanoTime();
                 
                 ExperimentResult cacheResult = analyzer.analyzeAlgorithmPerformance(
-                    "CacheAware_v2", completedTests, cacheTasks, CORES,
+                    CHALLENGER_NAME, completedTests, cacheTasks, CORES,
                     (cacheEndTime - cacheStartTime) / 1_000_000.0, utilization
                 );
-                algorithmResults.get("CacheAware_v2").add(cacheResult);
+                algorithmResults.get(CHALLENGER_NAME).add(cacheResult);
                 
                 // 计算性能差异
                 double makespanImprovement = wfdResult.makespan > 0
@@ -542,16 +628,19 @@ public class AlgorithmComparisonExperiment {
                     System.out.printf("✅ 完成 %d/%d 测试案例\n", completedTests, TOTAL_TEST_CASES);
                     System.out.printf("   当前makespan改进: %.2f%%\n", makespanImprovement * 100);
                     System.out.printf("   当前缓存命中率改进: %.3f\n", cacheHitImprovement);
-                    System.out.printf("   CacheAware_v2胜率: %.1f%%\n", 
+                    System.out.printf("   %s 胜率: %.1f%%\n", CHALLENGER_NAME,
                                      (double)cacheAwareWins / completedTests * 100);
-                    
-                    // 显示缓存状态报告
-                    System.out.println("   🗄️ 缓存状态快照:");
-                    Map<Integer, String> cacheReport = CacheAware_v2.getCacheStateReport();
-                    for (Map.Entry<Integer, String> entry : cacheReport.entrySet()) {
-                        System.out.println("     " + entry.getValue());
+
+                    // 缓存状态快照只有 v2 提供；v3 的历史表按用例重建，在这里打印
+                    // 只会给出"已经空了"的误导性快照，故跳过。
+                    if ("v2".equals(ALLOCATOR)) {
+                        System.out.println("   🗄️ 缓存状态快照:");
+                        Map<Integer, String> cacheReport = CacheAware_v2.getCacheStateReport();
+                        for (Map.Entry<Integer, String> entry : cacheReport.entrySet()) {
+                            System.out.println("     " + entry.getValue());
+                        }
+                        System.out.println();
                     }
-                    System.out.println();
                 }
             }
         }
@@ -560,6 +649,16 @@ public class AlgorithmComparisonExperiment {
         generateReport(algorithmResults, cacheAwareWins, wfdWins, completedTests,
                       totalMakespanImprovement, totalCacheHitImprovement);
         
+        // Numeric artifacts are required even when rendering is disabled.
+        if (!withViz || !ENABLE_VIZ) {
+            File resultDir = new File("result");
+            if (!resultDir.isDirectory() && !resultDir.mkdirs()) {
+                throw new IllegalStateException("Cannot create result directory");
+            }
+            String csv = withViz ? "result/algorithm_comparison_results.csv"
+                    : "result/algorithm_comparison_seed_" + seed + ".csv";
+            visualizer.exportToCSV(algorithmResults, csv);
+        }
         // 生成可视化图表（快速/CI 场景可用 --no-viz 跳过）
         if (withViz && ENABLE_VIZ) {
             generateVisualization(algorithmResults);
@@ -592,8 +691,15 @@ public class AlgorithmComparisonExperiment {
      * @param processors 可用处理器列表
      * @param algorithm Cache-Aware算法实例
      */
+    private static AllocationMethods newChallenger() {
+        if ("v3".equals(ALLOCATOR)) {
+            return new CacheAware_v3(CORES, SystemParameters.Level2CoreNum);
+        }
+        return new CacheAware_v2();
+    }
+
     private static void simulateCacheAwareAllocation(List<Node> tasks,
-            List<Integer> processors, CacheAware_v2 algorithm) {
+            List<Integer> processors, AllocationMethods algorithm) {
         
         // 共享执行/缓存模型：与 WFD 完全同一套口径（公平基线 C1）
         SharedCacheModel cacheModel = new SharedCacheModel(
@@ -731,7 +837,7 @@ public class AlgorithmComparisonExperiment {
             double totalMakespanImprovement, double totalCacheHitImprovement) {
         
         System.out.println("\n" + "=".repeat(80));
-        System.out.println("📈 WFD vs CacheAware_v2实验结果详细分析报告");
+        System.out.println("📈 WFD vs " + CHALLENGER_NAME + " 实验结果详细分析报告");
         System.out.println("=".repeat(80));
         
         // 基础统计
@@ -745,12 +851,12 @@ public class AlgorithmComparisonExperiment {
         System.out.printf("   ⏱️  平均Makespan改进（配对均值）: %.2f%%\n", avgMakespanImprovement);
         // 命中率差是「百分点」而非相对百分比，单位不可写成 %
         System.out.printf("   🎯 平均缓存命中率改进: %.2f 个百分点\n", avgCacheHitImprovement);
-        System.out.printf("   🏅 CacheAware_v2胜率: %d/%d = %.1f%%\n", 
+        System.out.printf("   🏅 %s 胜率: %d/%d = %.1f%%\n", CHALLENGER_NAME,
                           cacheAwareWins, totalTests, winRate);
         
         // 详细统计分析
         List<ExperimentResult> wfdResults = algorithmResults.get("WFD");
-        List<ExperimentResult> cacheResults = algorithmResults.get("CacheAware_v2");
+        List<ExperimentResult> cacheResults = algorithmResults.get(CHALLENGER_NAME);
           // 计算统计指标
         double wfdAvgMakespan = wfdResults.stream().mapToDouble(r -> r.makespan).average().orElse(0);
         double cacheAvgMakespan = cacheResults.stream().mapToDouble(r -> r.makespan).average().orElse(0);
@@ -762,7 +868,7 @@ public class AlgorithmComparisonExperiment {
         System.out.printf("     - 平均Makespan: %.0f ns\n", wfdAvgMakespan);
         System.out.printf("     - 平均缓存命中率: %.3f (%.1f%%)\n", wfdAvgCacheHit, wfdAvgCacheHit * 100);
         
-        System.out.printf("   CacheAware_v2算法:\n");
+        System.out.printf("   %s 算法:\n", CHALLENGER_NAME);
         System.out.printf("     - 平均Makespan: %.0f ns\n", cacheAvgMakespan);
         System.out.printf("     - 平均缓存命中率: %.3f (%.1f%%)\n", cacheAvgCacheHit, cacheAvgCacheHit * 100);
         
@@ -784,22 +890,9 @@ public class AlgorithmComparisonExperiment {
             System.out.printf("   ℹ️  样本量 n=%d < 20，均值与胜率的方差很大，"
                     + "该行结论仅作冒烟提示，不作为算法结论\n", totalTests);
         }
-        if (avgMakespanImprovement > 15) {
-            System.out.println("   ✅ Makespan改进显著 (>15%)，CacheAware_v2算法优势明显");
-        } else if (avgMakespanImprovement > 5) {
-            System.out.println("   ⚠️  Makespan改进中等 (5-15%)，CacheAware_v2算法有一定优势");
-        } else {
-            System.out.println("   ❌ Makespan改进较小 (<5%)，算法优势不够明显");
-        }
-        
-        if (winRate > 75) {
-            System.out.println("   ✅ 胜率优秀 (>75%)，CacheAware_v2算法稳定性好");
-        } else if (winRate > 60) {
-            System.out.println("   ⚠️  胜率良好 (60-75%)，CacheAware_v2算法较为稳定");
-        } else {
-            System.out.println("   ❌ 胜率偏低 (<60%)，算法性能不够稳定");
-        }
-        
+        System.out.println("   上述改善幅度与胜率为描述性统计，不代表统计显著性或系统稳定性。");
+        System.out.println("   请结合独立种子置信区间、工作负载范围与重复测量解释结果。");
+
         System.out.println("=".repeat(80));
     }
     
@@ -832,6 +925,8 @@ public class AlgorithmComparisonExperiment {
             // 调用Python脚本处理CSV数据
             runPythonVisualization(csvFilename);
             
+        } catch (java.io.UncheckedIOException e) {
+            throw e; // Required numeric artifacts must not be reported as successful.
         } catch (Exception e) {
             System.err.println("❌ 可视化生成失败: " + e.getMessage());
             e.printStackTrace();

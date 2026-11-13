@@ -1,0 +1,4 @@
+config                n     median        min        max
+none-sleep200         5      2.002      1.612      2.506
+shared-sleep200       5      1.702      1.550      2.395
+none-sleep0           5      1.105      0.731      1.363

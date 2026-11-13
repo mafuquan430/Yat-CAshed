@@ -1671,9 +1671,12 @@ static struct yat_job *yat_get_or_create_job(struct task_struct *p)
  *     O(nr_cpus) 的历史表扫描；
  *   - 保持 fork/exec 的原有行为，减少不必要的迁移。
  *
- * 返回值：若算出的核心不在 p->cpus_ptr 内，核心调度器的
- * is_cpu_allowed() 会兜底选择允许的核，所以这里无需自己校验亲和性。
+ * Wakeup candidates and sticky decisions must respect p->cpus_ptr.
+ * The core scheduler still revalidates the return value for hotplug races.
  */
+static int yat_find_best_core_allowed(struct yat_job *job,
+                                      const struct cpumask *allowed);
+
 int select_task_rq_yat_casched(struct task_struct *p, int task_cpu, int flags)
 {
     struct yat_job *job;
@@ -1712,7 +1715,8 @@ int select_task_rq_yat_casched(struct task_struct *p, int task_cpu, int flags)
      * READ_ONCE + 一次时间比较，不会把 O(nr_cpus^2) 的历史表扫描
      * 拖进 try_to_wake_up() 的关键路径。
      */
-    if (prev_core != YAT_INVALID_CORE && cpu_online(prev_core)) {
+    if (prev_core >= 0 && prev_core < nr_cpu_ids &&
+        cpu_active(prev_core) && cpumask_test_cpu(prev_core, p->cpus_ptr)) {
         now = ktime_get_ns();
 
         /* (a) 目标核当前空闲：上次的决策依然成立，直接复用 */
@@ -1731,7 +1735,7 @@ int select_task_rq_yat_casched(struct task_struct *p, int task_cpu, int flags)
         now = ktime_get_ns();
     }
 
-    best_core = yat_find_best_core_for_job(job);
+    best_core = yat_find_best_core_allowed(job, p->cpus_ptr);
     if (best_core == YAT_INVALID_CORE) {
         YAT_STAT_INC(select_nocore);
         return task_cpu;   /* 保留 task_cpu，通用层会做 is_cpu_allowed 兜底 */
@@ -2111,7 +2115,8 @@ bool yield_to_task_yat_casched(struct rq *rq, struct task_struct *p)
 
 void set_cpus_allowed_yat_casched(struct task_struct *p, struct affinity_context *ctx)
 {
-    /* CPU亲和性设置 */
+    /* Updates cpus_mask/nr_cpus_allowed and handles migrate-disable flags. */
+    set_cpus_allowed_common(p, ctx);
 }
 
 void rq_online_yat_casched(struct rq *rq)
@@ -2186,12 +2191,35 @@ void prio_changed_yat_casched(struct rq *rq, struct task_struct *task, int oldpr
 static void task_dead_yat_casched(struct task_struct *p)
 {
     struct yat_job *job = READ_ONCE(p->yat_casched.job);
+    unsigned long flags;
 
     if (!job)
         return;
 
     WRITE_ONCE(p->yat_casched.job, NULL);
+
+    /*
+     * 关中断后再销毁。
+     *
+     * 这里不是"多此一举"：yat_destroy_job() 要取 pool->lock 与 dag->lock，
+     * 而这两把锁在 balance 路径里总是**关中断**获取的
+     * （balance_yat_casched -> rq_lock(关中断) -> ... -> pool->lock），
+     * 于是它们在 lockdep 眼里是 HARDIRQ-safe 锁。
+     * 若在 task_dead（finish_task_switch 调用，中断是开的）里直接取，
+     * lockdep 会报出真实的 ABBA：
+     *
+     *   CPU0: lock(pool->lock)                      // 中断开
+     *   CPU1: lock(rq->lock, 中断关) -> lock(pool->lock)
+     *   <CPU0 中断> lock(rq->lock)                  // 环闭合
+     *
+     * 实测该告警在 QEMU 串口里可复现（见 docs/validation/，镜像 #18）。
+     * 用 local_irq_save() 把整段销毁放进关中断区间后，pool->lock/dag->lock
+     * 的获取上下文与其它路径一致，环被打断；临界区内只有 list 操作和
+     * kfree，不会睡眠，时延是常数级。
+     */
+    local_irq_save(flags);
     yat_destroy_job(job);
+    local_irq_restore(flags);
 }
 
 /*
@@ -2351,7 +2379,8 @@ u64 yat_calculate_impact(struct yat_job *job, int core)
  * 加速表只记录「最终选中的 (job, cpu, benefit, crp)」快照，回归它作为
  * 可观测性缓存的本来用途，不再承担控制流职责。
  */
-int yat_find_best_core_for_job(struct yat_job *job)
+static int yat_find_best_core_allowed(struct yat_job *job,
+                                      const struct cpumask *allowed)
 {
     int best_core = YAT_INVALID_CORE;
     u64 max_benefit = 0;
@@ -2363,6 +2392,12 @@ int yat_find_best_core_for_job(struct yat_job *job)
     int cpu;
     
     for_each_online_cpu(cpu) {
+        /* Wakeup caller holds p->pi_lock: cpus_ptr is stable here.
+         * Legacy pool-only placement has no task mask and passes NULL.
+         * Filter before recency scans and never cache an inadmissible winner.
+         */
+        if (allowed && (!cpu_active(cpu) || !cpumask_test_cpu(cpu, allowed)))
+            continue;
         recency = yat_calculate_recency(job->job_id, cpu, now);
         crp_ratio = yat_get_crp_ratio(recency);
         current_benefit = ((1000 - crp_ratio) * job->wcet) / 1000;
@@ -2407,6 +2442,12 @@ int yat_find_best_core_for_job(struct yat_job *job)
     }
     
     return best_core;
+}
+
+/* Pool-only callers retain their existing placement semantics. */
+int yat_find_best_core_for_job(struct yat_job *job)
+{
+    return yat_find_best_core_allowed(job, NULL);
 }
 
 /*

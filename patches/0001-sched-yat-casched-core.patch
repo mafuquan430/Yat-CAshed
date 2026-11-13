@@ -504,7 +504,7 @@ Upstream: linux v6.8 (torvalds)
 +#include <trace/define_trace.h>
 --- /dev/null
 +++ b/kernel/sched/yat_casched.c
-@@ -0,0 +1,2711 @@
+@@ -0,0 +1,2729 @@
 +/*
 + * Yat-CAShed - AJLR层级化DAG调度器 (Decision Final Version)
 + *
@@ -2178,9 +2178,12 @@ Upstream: linux v6.8 (torvalds)
 + *     O(nr_cpus) 的历史表扫描；
 + *   - 保持 fork/exec 的原有行为，减少不必要的迁移。
 + *
-+ * 返回值：若算出的核心不在 p->cpus_ptr 内，核心调度器的
-+ * is_cpu_allowed() 会兜底选择允许的核，所以这里无需自己校验亲和性。
++ * Wakeup candidates and sticky decisions must respect p->cpus_ptr.
++ * The core scheduler still revalidates the return value for hotplug races.
 + */
++static int yat_find_best_core_allowed(struct yat_job *job,
++                                      const struct cpumask *allowed);
++
 +int select_task_rq_yat_casched(struct task_struct *p, int task_cpu, int flags)
 +{
 +    struct yat_job *job;
@@ -2219,7 +2222,8 @@ Upstream: linux v6.8 (torvalds)
 +     * READ_ONCE + 一次时间比较，不会把 O(nr_cpus^2) 的历史表扫描
 +     * 拖进 try_to_wake_up() 的关键路径。
 +     */
-+    if (prev_core != YAT_INVALID_CORE && cpu_online(prev_core)) {
++    if (prev_core >= 0 && prev_core < nr_cpu_ids &&
++        cpu_active(prev_core) && cpumask_test_cpu(prev_core, p->cpus_ptr)) {
 +        now = ktime_get_ns();
 +
 +        /* (a) 目标核当前空闲：上次的决策依然成立，直接复用 */
@@ -2238,7 +2242,7 @@ Upstream: linux v6.8 (torvalds)
 +        now = ktime_get_ns();
 +    }
 +
-+    best_core = yat_find_best_core_for_job(job);
++    best_core = yat_find_best_core_allowed(job, p->cpus_ptr);
 +    if (best_core == YAT_INVALID_CORE) {
 +        YAT_STAT_INC(select_nocore);
 +        return task_cpu;   /* 保留 task_cpu，通用层会做 is_cpu_allowed 兜底 */
@@ -2618,7 +2622,8 @@ Upstream: linux v6.8 (torvalds)
 +
 +void set_cpus_allowed_yat_casched(struct task_struct *p, struct affinity_context *ctx)
 +{
-+    /* CPU亲和性设置 */
++    /* Updates cpus_mask/nr_cpus_allowed and handles migrate-disable flags. */
++    set_cpus_allowed_common(p, ctx);
 +}
 +
 +void rq_online_yat_casched(struct rq *rq)
@@ -2858,7 +2863,8 @@ Upstream: linux v6.8 (torvalds)
 + * 加速表只记录「最终选中的 (job, cpu, benefit, crp)」快照，回归它作为
 + * 可观测性缓存的本来用途，不再承担控制流职责。
 + */
-+int yat_find_best_core_for_job(struct yat_job *job)
++static int yat_find_best_core_allowed(struct yat_job *job,
++                                      const struct cpumask *allowed)
 +{
 +    int best_core = YAT_INVALID_CORE;
 +    u64 max_benefit = 0;
@@ -2870,6 +2876,12 @@ Upstream: linux v6.8 (torvalds)
 +    int cpu;
 +    
 +    for_each_online_cpu(cpu) {
++        /* Wakeup caller holds p->pi_lock: cpus_ptr is stable here.
++         * Legacy pool-only placement has no task mask and passes NULL.
++         * Filter before recency scans and never cache an inadmissible winner.
++         */
++        if (allowed && (!cpu_active(cpu) || !cpumask_test_cpu(cpu, allowed)))
++            continue;
 +        recency = yat_calculate_recency(job->job_id, cpu, now);
 +        crp_ratio = yat_get_crp_ratio(recency);
 +        current_benefit = ((1000 - crp_ratio) * job->wcet) / 1000;
@@ -2914,6 +2926,12 @@ Upstream: linux v6.8 (torvalds)
 +    }
 +    
 +    return best_core;
++}
++
++/* Pool-only callers retain their existing placement semantics. */
++int yat_find_best_core_for_job(struct yat_job *job)
++{
++    return yat_find_best_core_allowed(job, NULL);
 +}
 +
 +/*

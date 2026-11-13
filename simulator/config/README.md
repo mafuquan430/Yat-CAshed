@@ -82,3 +82,13 @@ java -cp ... AlgorithmComparisonExperiment --config=config/paper.yaml
 - [`../Simulator.md`](../Simulator.md) — 模拟器总体说明
 - [`../../docs/SCHEMA.md`](../../docs/SCHEMA.md) — CSV 字段与图表文件命名的统一约定
 - [`../../docs/EXPERIMENT_REPORT.md`](../../docs/EXPERIMENT_REPORT.md) — 实验设计与结论
+
+### 多种子校验
+
+多种子列表必须非空且无重复，CLI覆盖后同样执行校验。--seeds= 后不可留空，逗号列表不可有空元素。非法输入以状态码2退出。不同种子并不自动保证统计独立，详见 [输入完整性说明](../../docs/SEED_VALIDATION_2026-10-29.md)。
+
+CLI严格模式：--cores、--cases、--tasks必须为正整数，未知参数报错退出，不再自动修正或忽略。
+
+### 显式来源与种子模式
+
+YAT_SIM_CONFIG指定无效路径时会失败；--config优先于环境变量。--seed=N会清除配置中的多种子列表，同一命令中--seed与--seeds按最后出现的模式生效。导出回归脚本优先使用JAVA_HOME/bin/java。

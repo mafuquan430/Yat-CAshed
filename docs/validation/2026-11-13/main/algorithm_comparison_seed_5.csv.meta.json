@@ -1,0 +1,8 @@
+{
+  "csv_schema_version": 1,
+  "csv_file": "algorithm_comparison_seed_5.csv",
+  "columns": ["Algorithm", "TestCase", "Makespan", "CacheHit", "TotalExecutionTime", "AvgExecutionTime", "ResponseTime", "CpuUtilization", "LoadBalance"],
+  "algorithms": ["CacheAware_v2", "WFD"],
+  "data_rows": 200,
+  "note": "实验参数见 config/*.yaml；本文件只描述 CSV 结构"
+}

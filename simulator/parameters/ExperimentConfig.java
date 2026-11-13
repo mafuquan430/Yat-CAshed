@@ -29,7 +29,7 @@ import java.util.Set;
  * </pre>
  *
  * <h3>兼容性约束（硬性）</h3>
- * 若找不到配置文件，必须回落到<b>与改动前完全一致</b>的内置默认值，
+ * 未显式指定文件或环境变量且自动发现未命中时，回落到<b>与改动前完全一致</b>的内置默认值，
  * 使 {@code make run-quick} 等既有入口行为不变。因此这里的默认值逐项对齐
  * 原 {@code AlgorithmComparisonExperiment} 的常量与原 {@code setupSystemParameters()} 的赋值。
  *
@@ -137,7 +137,7 @@ public final class ExperimentConfig {
      *   <li>显式 {@code --config=PATH}（由调用方预先解析后传入 {@code explicit}）</li>
      *   <li>环境变量 {@code YAT_SIM_CONFIG}</li>
      *   <li>{@code ./config/default.yaml}（相对当前工作目录，即 {@code simulator/}）</li>
-     *   <li>相对本类所在位置推导的 {@code ../config/default.yaml}</li>
+     *   <li>{@code ./simulator/config/default.yaml}（相对当前工作目录）</li>
      * </ol>
      *
      * @param explicit 显式路径；{@code null} 表示未指定
@@ -161,6 +161,13 @@ public final class ExperimentConfig {
                 throw new ConfigException("指定的配置文件不存在: " + explicit);
             }
             return load(explicit);
+        }
+        if (env != null && !env.trim().isEmpty()) {
+            Path environmentPath = Paths.get(env.trim());
+            if (!Files.isRegularFile(environmentPath)) {
+                throw new ConfigException("YAT_SIM_CONFIG is not a regular file: " + environmentPath);
+            }
+            return load(environmentPath);
         }
         for (Path candidate : candidates) {
             if (Files.isRegularFile(candidate)) {
@@ -320,6 +327,12 @@ public final class ExperimentConfig {
             if (seeds.length == 0) {
                 throw new ConfigException("experiment.seeds 不能为空列表（用 null 表示单种子路径）");
             }
+            Set<Long> uniqueSeeds = new LinkedHashSet<>();
+            for (long value : seeds) {
+                if (!uniqueSeeds.add(value)) {
+                    throw new ConfigException("experiment.seeds contains duplicate seed: " + value);
+                }
+            }
         }
     }
 
@@ -327,27 +340,28 @@ public final class ExperimentConfig {
 
     /** 幂等：命令行显式给出即为最高优先级。 */
     public void overrideCores(int v) {
-        cores = Math.max(1, v);
+        cores = v;
         explicitKeys.add("experiment.cores");
     }
 
     public void overrideTotalTestCases(int v) {
-        totalTestCases = Math.max(1, v);
+        totalTestCases = v;
         explicitKeys.add("experiment.total_test_cases");
     }
 
     public void overrideTasksPerCase(int v) {
-        tasksPerCase = Math.max(1, v);
+        tasksPerCase = v;
         explicitKeys.add("experiment.tasks_per_case");
     }
 
     public void overrideSeed(long v) {
         seed = v;
+        seeds = null; // An explicit single seed overrides a configured seed list.
         explicitKeys.add("experiment.seed");
     }
 
     public void overrideSeeds(long[] v) {
-        seeds = v;
+        seeds = v == null ? null : v.clone();
         explicitKeys.add("experiment.seeds");
     }
 

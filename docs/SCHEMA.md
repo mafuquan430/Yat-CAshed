@@ -195,3 +195,7 @@ CSV 列数与格式串的一致性由代码保证，而非靠人记住：
 - [`simulator/config/README.md`](../simulator/config/README.md) — 实验参数配置
 - [`DEPENDENCIES.md`](DEPENDENCIES.md) — 依赖治理
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — 模块与数据流
+
+## 导出失败契约（2026-10-28）
+
+CSV使用固定小数点格式与UTF-8，不受主机区域设置影响。CSV和元数据均为必需产物，任一写入失败会使实验非零退出；失败后禁止消费残留文件。双文件写入不具备事务原子性。验证方式见 [导出可靠性记录](EXPORT_RELIABILITY_2026-10-28.md)。

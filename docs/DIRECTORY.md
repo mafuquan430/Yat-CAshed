@@ -43,16 +43,18 @@ Yat-CAShed/
 │   ├── kernel/sched/yat_casched.c         # 调度器核心（AJLR，路线 A）
 │   ├── include/linux/sched/yat_casched.h  # 数据结构与接口声明
 │   ├── yat_casched优化记录.md              # 迭代优化记录
-│   ├── boot_test_scripts/                 # 用户态 C 测试程序（极简 QEMU 环境）
-│   │   ├── README.md
+│   ├── boot_test_scripts/                 # **只放 C 源码**（A7 约定）
+│   │   ├── README.md                      #   程序说明 + yat_bench 参数/CSV 字段
 │   │   ├── SIMPLE_TEST_README.md
-│   │   ├── build_yat_simple_test.sh
-│   │   ├── start_yat_simple_test.sh
-│   │   └── yat_simple_test.c
-│   ├── yat_test_scripts/                  # QEMU 测试环境脚本
+│   │   ├── yat_simple_test.c              #   功能冒烟
+│   │   └── yat_bench.c                    #   负载基准（--affinity/--sleep-us/--verbose）
+│   ├── yat_test_scripts/                  # **只放 Shell 脚本**（A7 约定）
 │   │   ├── README.md
-│   │   ├── create_test_initramfs.sh
-│   │   ├── start_test_environment.sh
+│   │   ├── compare_cfs_vs_yat.sh          #   ★ CFS vs Yat 自动对比，产出 CSV
+│   │   ├── create_test_initramfs.sh       #   编译 C 程序 + 打包 initramfs
+│   │   ├── start_test_environment.sh      #   交互式 QEMU（bzImage + -smp）
+│   │   ├── build_yat_simple_test.sh       #   极简环境：构建（产物落 yat_simple_test_env/）
+│   │   ├── start_yat_simple_test.sh       #   极简环境：启动
 │   │   ├── start_qemu_simple.sh
 │   │   ├── start_qemu_yat_test.sh
 │   │   ├── quick_test_guide.sh

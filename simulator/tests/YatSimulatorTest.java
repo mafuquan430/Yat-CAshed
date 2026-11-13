@@ -517,6 +517,20 @@ public class YatSimulatorTest {
         checkEq("默认 level2_core_num=2", 2, def.level2CoreNum);
         check("默认走单种子路径（seeds == null）", def.seeds == null);
 
+        ExperimentConfig seedConfig = ExperimentConfig.defaults();
+        long[] sourceSeeds = {0, -1, Long.MAX_VALUE};
+        seedConfig.overrideSeeds(sourceSeeds);
+        sourceSeeds[0] = -1;
+        seedConfig.validate();
+        checkEq("seed override copies input", 0L, seedConfig.seeds[0]);
+        seedConfig.overrideSeeds(new long[]{7, 7});
+        boolean duplicateRejected = false;
+        try { seedConfig.validate(); }
+        catch (ExperimentConfig.ConfigException e) {
+            duplicateRejected = e.getMessage().contains("duplicate seed");
+        }
+        check("duplicate independent observations rejected", duplicateRejected);
+
         // G) 未知键必须报错（拼错一个字母不能静默忽略）
         boolean unknownRejected = false;
         String unknownMsg = "";
@@ -636,11 +650,50 @@ public class YatSimulatorTest {
         }
     }
 
+    private static void testMetricBoundaries() {
+        Node n = new Node(0, Node.NodeType.SOLO, 1, 1,
+                new RecencyProfileReal(100), new Random(1));
+        n.partition = 0;
+        n.expectedET = 100;
+        n.release = 1000;
+        n.start = 1000;
+        n.finishAt = 1200;
+        PerformanceAnalyzer a = new PerformanceAnalyzer();
+        PerformanceAnalyzer.ExperimentResult r = a.analyzeAlgorithmPerformance("WFD", 0, List.of(n), 4);
+        checkNear("concentrated load stays in [0,1]", 0.0, r.loadBalance, 1e-12);
+        checkEq("relative deadline includes release; equality is on time", 0, r.missedDeadlines);
+        n.finishAt = 1201;
+        checkEq("one unit late misses deadline", 1,
+                a.analyzeAlgorithmPerformance("WFD", 1, List.of(n), 4).missedDeadlines);
+        n.expectedET = Long.MAX_VALUE;
+        checkEq("deadline multiplication does not overflow", 0,
+                a.analyzeAlgorithmPerformance("WFD", 2, List.of(n), 4).missedDeadlines);
+    }
+    private static void testConfidenceInterval() {
+        checkNear("t df=1", 12.706204736, analyzer.ConfidenceInterval.critical95(2), 1e-6);
+        checkNear("t df=31 does not drop to normal", 2.039513446,
+                analyzer.ConfidenceInterval.critical95(32), 1e-6);
+        checkNear("known mean interval", 1.963243161,
+                analyzer.ConfidenceInterval.halfWidth95(new double[]{1,2,3,4,5}), 1e-6);
+        check("singleton uncertainty unavailable", Double.isNaN(
+                analyzer.ConfidenceInterval.halfWidth95(new double[]{3})));
+        checkNear("constant sample", 0,
+                analyzer.ConfidenceInterval.halfWidth95(new double[]{3,3,3}), 0);
+        for (double[] bad : new double[][]{{}, {Double.NaN, 1}, {1, Double.POSITIVE_INFINITY}}) {
+            boolean rejected = false;
+            try { analyzer.ConfidenceInterval.halfWidth95(bad); }
+            catch (IllegalArgumentException e) { rejected = true; }
+            check("invalid observations rejected", rejected);
+        }
+    }
+
     public static void main(String[] args) {
         System.out.println("==========================================");
         System.out.println(" Yat-CAShed 模拟器单元测试");
         System.out.println("==========================================");
 
+        testMetricBoundaries();
+        testConfidenceInterval();
         testNode();
         testRecencyProfile();
         testCRPBoundaries();

@@ -1,4 +1,4 @@
-#!/bin/bash
+ig#!/bin/bash
 #
 # 一键启动「交互式」Yat-CAShed 测试环境（进 shell 手动跑命令、看 proc/debugfs）。
 #

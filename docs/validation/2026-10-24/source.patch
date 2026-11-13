@@ -1,0 +1,1466 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index b06493006..c36be47d3 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -38,6 +38,14 @@
+   `compare_cfs_vs_yat.sh` 三条命令，并给出实测基线与限定说明；
+   符号统计更正为实测的 29 声明 / 27 非 static 定义 / 28 static 定义。
+ 
++### 移除（Removed）
++
++- 删除 `linux-6.8-main/initramfs/init` 与 `initramfs_fixed/init`：不被任何脚本引用，
++  `CONFIG_INITRAMFS_SOURCE` 也留空，属于早期手工环境的遗留副本。
++- 停止跟踪 `linux-6.8-main/yat_simple_test_env/initramfs/init`：`build_yat_simple_test.sh`
++  会先 `rm -rf` 整个目录再用 heredoc 重写 `init`，跟踪它等于让脚本删掉受版本控制的文件；
++  改为整目录 `.gitignore`。`patches/0005` 相应由 23 hunk 降为 20 hunk。
++
+ ### 文档更正（Docs）
+ 
+ - ROADMAP 总览表把 A8 由「实测待跑」改为「已完成（接管率 98%）」；
+@@ -48,6 +56,14 @@
+   遗留的 `test_visualization/performance_results.csv` 降级为历史资料并标注不可用。
+ - ARCHITECTURE §5.1 关闭「接管率尚未实测」，写入 512/254/254/925·0·14 与 98%，
+   同时保留「墙钟差异 ≠ AJLR 收益」的限定。
++- `boot_test_scripts/README.md` 补齐 `yat_bench` 的完整参数表（`--affinity`
++  三种模式的语义与能否测到 AJLR、`--sleep-us`、`--verbose`）、13 列 CSV 字段说明，
++  以及「验证 A8 必须 none + sleep-us > 0」的原因。
++- ARCHITECTURE §3.1.2 增加 `yat_bench` 参数表与 CSV/SCHEMA 交叉引用；
++  §3.2.1 增加「决策链路成立的四个前提」表（对应 A8.1 的四个坑）；
++  §3.1.1 补充 `ttwu_*` 由 `yat_probe_ttwu()` 在 core.c 四个出口累加、只统计 yat 任务。
++- DIRECTORY 的 `boot_test_scripts/` 与 `yat_test_scripts/` 清单按 A7 约定更正
++  （脚本不再混在 C 源码目录、补上 `compare_cfs_vs_yat.sh` 与 `yat_bench.c`）。
+ 
+ ---
+ 
+@@ -801,3 +817,9 @@ guest **静默挂死**（串口无输出、4 个 vCPU 全部 idle、`jobs_placed
+ - **锁序需审查**：`balance_yat_casched()`（CPU0）在持 `yat_pool_lock` 时再 `rq_lock(target)`，
+   与 `global_dag_lock` / `yat_accel_table.lock` 的相对顺序需用 `lockdep` 验证
+   （见 [`docs/ROADMAP.md`](docs/ROADMAP.md) A5）。
++
++## 2026-10-24 指标与论文证据修补
++- 修复负载均衡度负值及代理截止期释放时间/溢出问题，新增四项回归断言（106 项通过）。
++- 修订论文摘要及实验章，明确证据边界和复现协议。详见 docs/REPAIR_REVIEW_2026-10-24.md。
++
++- 续轮：归档理论章未追溯实验段落，撤下全局最优表述；WSL verify-all、kernel-obj 与论文构建通过，排版警告待处理。
+diff --git a/README.md b/README.md
+index 8eae2b640..5f2b3a83d 100644
+--- a/README.md
++++ b/README.md
+@@ -232,3 +232,5 @@ make report      # 优先 latexmk -xelatex，产物 report/paper/Yat-CAShed.pdf
+   第三方依赖 `simulator/lib/commons-math3-3.6.1.jar` 归其作者所有（Apache-2.0）。
+ - **文档与论文**（`docs/`、`report/` 中本项目撰写部分）：学术研究与教学使用，转载请注明出处。
+   `report/` 内引用的第三方论文 PDF 版权归原作者，仅作学习研究。
++
++> 2026-10-24 复核：上文历史收益不能作为当前统一模型结论。五种子500配对用例的 Makespan 改善均值为 -0.954%，95%区间跨零；详见 [复核结果](docs/validation/2026-10-24/SUMMARY.md)。无图模式现已修复为正常导出 CSV。
+diff --git a/docs/ARCHITECTURE.md b/docs/ARCHITECTURE.md
+index 4763022ad..b7b70b751 100644
+--- a/docs/ARCHITECTURE.md
++++ b/docs/ARCHITECTURE.md
+@@ -89,6 +89,11 @@ graph TD
+ | 选取 | `pick_calls/pick_null_desync` | `pick_null_desync > 0` 即「核心层说有任务、本类说没有」的计数失步 |
+ | 接管率 | `place_hit/place_miss/place_pending` | **AJLR 决策最终有没有被执行**（累计值） |
+ 
++其中 `ttwu_*` 四个字段由 [`yat_probe_ttwu()`](../linux-6.8-main/kernel/sched/yat_casched.c)
++在 core.c 的 `try_to_wake_up()` 四个出口处调用累加，**只统计目标是 yat 类的唤醒**——
++否则 guest 里 init / busybox 等 CFS 任务的唤醒会把计数冲到几十万，yat 的那几次被淹没。
++`place_*` 则在 `pick_next_task` 选中任务时累加，因此不受「作业随任务退出而释放」影响。
++
+ 读法要点：
+ 
+ - `select_calls == 0` 且 `enq_calls > 0`：任务确实进了 yat 类，但**唤醒没走到选核**
+@@ -132,6 +137,20 @@ yat_casched:yat_casched_enqueue / _dequeue / _pick / _place / _wakeup_place / _a
+ 两轮为**两个独立 QEMU 进程**，唯一变量是调度策略。
+ Makefile 侧由 `kernel-compare` 目标驱动。
+ 
++`yat_bench` 的关键参数（A8 之后新增的后三个决定「能不能测到 AJLR」）：
++
++| 参数 | 作用 | 注意 |
++|------|------|------|
++| `--tasks/--iters/--cpu` | 负载规模与 `shared` 模式下的目标核 | — |
++| `--affinity shared\\|none\\|spread` | 亲和性模式 | `shared` 使 `nr_cpus_allowed == 1` → `select_task_rq` 包装层直接返回，**不调用调度类** |
++| `--sleep-us U` | 每段计算后 `nanosleep`（固定切 64 段） | `0` 时只有 `WF_FORK`，本类在非 `WF_TTWU` 早退 |
++| `--verbose` | 逐阶段打印 `YTASK` 标记 | 仅排障用；正常测量会污染 `vol_ctx` |
++
++因此**验证 A8 的负载必须同时满足 `--affinity none` 与 `--sleep-us > 0`**；
++脚本会自动判定并在结尾打印 ⚠️ / ✅。CSV 为 13 列，末尾两列 `affinity,sleep_us`
++是自描述字段（追加，不打乱旧列），列定义见 [`SCHEMA.md`](SCHEMA.md) §2.1。
++完整操作步骤见 [`OPERATIONS.md`](OPERATIONS.md)。
++
+ ### 3.2 调度类关键回调（`DEFINE_SCHED_CLASS`）
+ 
+ `.enqueue_task .dequeue_task .yield_task .yield_to_task .wakeup_preempt .pick_next_task
+@@ -160,6 +179,20 @@ pick_next_task
+ task_dead  → yat_destroy_job(job)：作业生命周期与 task_struct 对齐，精确释放一次
+ ```
+ 
++**这条链路成立的前提（A8.1 实跑踩出来的四个坑）**：上面每一步都依赖「任务确实在
++yat 类里、且 `rq->nr_running` 与类内计数同步」。任一条不成立，链路会安静地断在中间：
++
++| 前提 | 破坏后的表现 | 修复位置 |
++|------|--------------|----------|
++| yat 策略的 `p->prio` 不能落进实时区间 | 任务被挂到 `rt_sched_class`，类内空无一人 | `__normal_prio()`（core.c） |
++| `__setscheduler_prio()` 必须按策略判定 | 同上，分支被 `rt_prio()` 抢先 | 同上 |
++| `sched_fork()` 必须识别 yat 策略 | 子任务降级为 CFS | core.c `sched_fork` |
++| enqueue/dequeue 必须调用 `add_nr_running()/sub_nr_running()` | `rq->nr_running` 恒 0 → `__pick_next_task()` 连 yat 类都不遍历 → CPU 进 idle、任务永不运行（静默挂死） | `enqueue/dequeue_task_yat_casched()` |
++
++因此排障时的第一问题永远是：**`enq_calls` 有没有涨？`ttwu_ok` 有没有涨？**
++两者都涨而 `select_calls` 不涨，才是选核逻辑本身的问题。详见
++[ROADMAP.md](ROADMAP.md) §A8.1 与 [`OPERATIONS.md`](OPERATIONS.md) 的「计数器读法」。
++
+ **为什么不在 `balance()` 里迁移**：`class->balance()` 由 `put_prev_task_balance()`
+ 在持有本核 `rq_lock` 时调用；跨核 `set_task_cpu()` 需要目标核 `rq_lock`，
+ 这会构成 `rq_lock(A) → rq_lock(B)` 的嵌套，违反 A5 确立的锁序
+diff --git a/docs/DEVELOPMENT.md b/docs/DEVELOPMENT.md
+index 8ce9fa89e..cd11f3cdd 100644
+--- a/docs/DEVELOPMENT.md
++++ b/docs/DEVELOPMENT.md
+@@ -94,7 +94,7 @@ cd simulator
+ make help                # 查看全部目标
+ make compile             # 编译
+ make lib-test            # 依赖库自检
+-make test                # 单元测试（tests/YatSimulatorTest.java，102 断言）
++make test                # 单元测试（tests/YatSimulatorTest.java，58 断言）
+ make run-quick           # 轻量实验
+ make run                 # 全量实验（100 用例）+ 可视化 + 3 张 300dpi 图表
+ make picture             # 单独生成图表
+diff --git a/docs/DIRECTORY.md b/docs/DIRECTORY.md
+index 5a25352a0..2ac8181a5 100644
+--- a/docs/DIRECTORY.md
++++ b/docs/DIRECTORY.md
+@@ -43,16 +43,18 @@ Yat-CAShed/
+ │   ├── kernel/sched/yat_casched.c         # 调度器核心（AJLR，路线 A）
+ │   ├── include/linux/sched/yat_casched.h  # 数据结构与接口声明
+ │   ├── yat_casched优化记录.md              # 迭代优化记录
+-│   ├── boot_test_scripts/                 # 用户态 C 测试程序（极简 QEMU 环境）
+-│   │   ├── README.md
++│   ├── boot_test_scripts/                 # **只放 C 源码**（A7 约定）
++│   │   ├── README.md                      #   程序说明 + yat_bench 参数/CSV 字段
+ │   │   ├── SIMPLE_TEST_README.md
+-│   │   ├── build_yat_simple_test.sh
+-│   │   ├── start_yat_simple_test.sh
+-│   │   └── yat_simple_test.c
+-│   ├── yat_test_scripts/                  # QEMU 测试环境脚本
++│   │   ├── yat_simple_test.c              #   功能冒烟
++│   │   └── yat_bench.c                    #   负载基准（--affinity/--sleep-us/--verbose）
++│   ├── yat_test_scripts/                  # **只放 Shell 脚本**（A7 约定）
+ │   │   ├── README.md
+-│   │   ├── create_test_initramfs.sh
+-│   │   ├── start_test_environment.sh
++│   │   ├── compare_cfs_vs_yat.sh          #   ★ CFS vs Yat 自动对比，产出 CSV
++│   │   ├── create_test_initramfs.sh       #   编译 C 程序 + 打包 initramfs
++│   │   ├── start_test_environment.sh      #   交互式 QEMU（bzImage + -smp）
++│   │   ├── build_yat_simple_test.sh       #   极简环境：构建（产物落 yat_simple_test_env/）
++│   │   ├── start_yat_simple_test.sh       #   极简环境：启动
+ │   │   ├── start_qemu_simple.sh
+ │   │   ├── start_qemu_yat_test.sh
+ │   │   ├── quick_test_guide.sh
+diff --git a/docs/README.md b/docs/README.md
+index 1aeb93e4a..677db3cdc 100644
+--- a/docs/README.md
++++ b/docs/README.md
+@@ -77,3 +77,8 @@
+ 4. **链接门禁**：`make docs-check` 会校验本索引及全仓库 Markdown 的相对链接，
+    CI 已接入；新增/移动文档后请本地先跑一次。
+ 5. **归档**：被取代的文档移入 `docs/archive/` 并在其 README 登记，不直接删除。
++
++- [2026-10-24 修补与论文证据审计](REPAIR_REVIEW_2026-10-24.md)：本轮修复、测试结果及待验收事项。
++
++- [完善任务验收](COMPLETION_TASKS.md)
++- [五种子复核结果](validation/2026-10-24/SUMMARY.md)
+diff --git a/linux-6.8-main/boot_test_scripts/README.md b/linux-6.8-main/boot_test_scripts/README.md
+index 1b223eb52..77ed35f41 100644
+--- a/linux-6.8-main/boot_test_scripts/README.md
++++ b/linux-6.8-main/boot_test_scripts/README.md
+@@ -36,25 +36,56 @@ boot_test_scripts/
+ 打印每个进程的 PID、`sched_getcpu()` 结果与策略设置返回值。用途是**功能性验证**：
+ 调度类是否注册、`sched_setattr` 是否被接受、任务是否真的被调度到 CPU 上。
+ 
+-### `yat_bench.c` —— 快不快
++### `yat_bench.c` —— 快不快，以及 AJLR 有没有生效
+ 
+-同一份固定工作量（LCG + 异或混合，避免被编译器优化掉），在指定 CPU 上跑 `iters` 次，
+-N 个子进程并行，父进程通过 pipe 收回每个子进程的墙钟时间，聚合成一行 CSV：
++同一份固定工作量（LCG + 异或混合，避免被编译器优化掉），N 个子进程并行跑 `iters` 次，
++父进程通过 pipe 收回每个子进程的墙钟时间，聚合成一行 CSV。
++
++#### 命令行参数
++
++| 参数 | 默认 | 说明 |
++|------|------|------|
++| `--policy cfs\\|yat` | `cfs` | 目标策略（由内核命令行 `yatbench=` 传入，保证同一二进制） |
++| `--tasks N` | 4 | 并发子进程数（上限 `MAX_TASKS`） |
++| `--iters M` | 20000000 | 每个子进程的固定迭代次数 |
++| `--cpu C` | 0 | `--affinity shared` 时 pin 到哪个物理 CPU |
++| `--affinity shared\\|none\\|spread` | `shared` | 亲和性模式，见下表 |
++| `--sleep-us U` | 0 | 每段计算后 `nanosleep` U 微秒，制造真实唤醒；计算固定切 64 段 |
++| `--verbose` | 关 | 逐阶段打印 `YTASK` 标记，仅用于 guest 挂死时定位 |
++
++亲和性模式的区别（**这条直接决定能不能测到 AJLR**）：
++
++| 模式 | 行为 | `nr_cpus_allowed` | 能测什么 |
++|------|------|-------------------|----------|
++| `shared` | 全部 pin 到 `--cpu` | 1 | 同核竞争下的时间片分配；**测不到 AJLR**（`core.c` 的包装层直接 `cpumask_any()` 返回，不调用调度类） |
++| `none` | 不设亲和性 | 在线 CPU 数 | 跨核放置；A8 验证**必须**用这个 |
++| `spread` | 第 i 个任务 pin 到 CPU `i % 在线数` | 1 | 强制初始分散，观察是否会被重新收敛 |
++
++> 另外 `--sleep-us 0` 时任务从不阻塞，只有 `WF_FORK`，而
++> `select_task_rq_yat_casched()` 刻意在非 `WF_TTWU` 早退 —— 所以
++> **验证 AJLR 必须同时满足 `--affinity none` 与 `--sleep-us > 0`**。
++> 早期版本把任务固定 pin 到单核且从不阻塞，两个条件同时不成立，
++> 这正是历史上「`jobs_placed` 恒 0」的直接原因（详见仓库
++> [`docs/ROADMAP.md`](../../docs/ROADMAP.md) §A8.1）。
++
++#### 输出
+ 
+ ```
+-YATCSV,policy,tasks,iters,cpu,sum_wall_ns,min_wall_ns,max_wall_ns,sum_work_units,vol_ctx,invol_ctx,cpus_online
++YATCSV,policy,tasks,iters,cpu,sum_wall_ns,min_wall_ns,max_wall_ns,sum_work_units,
++       vol_ctx,invol_ctx,cpus_online,affinity,sleep_us
+ ```
+ 
+-字段含义：
++（实际是一行，这里为可读性折行；共 **13 列**。）
+ 
+ | 字段 | 说明 |
+ |------|------|
+ | `policy` | `cfs` 或 `yat`（由内核命令行 `yatbench=` 传入） |
+-| `sum_wall_ns` | N 个子进程墙钟时间之和（ns） |
++| `sum_wall_ns` | N 个子进程墙钟时间之和（ns），**主指标** |
+ | `min/max_wall_ns` | 单个子进程的最快 / 最慢墙钟时间（反映离散度） |
+ | `sum_work_units` | 校验和：应为 `tasks × iters`，用于确认真的跑完了 |
+ | `vol_ctx` / `invol_ctx` | 自愿 / 非自愿上下文切换次数（读 `/proc/self/status`） |
+ | `cpus_online` | guest 内 `_SC_NPROCESSORS_ONLN`；**必须 > 1**，否则对比无意义 |
++| `affinity` / `sleep_us` | A8 阶段追加的自描述列（加在行尾，旧列位置不变），用于事后判断这组数据能否评价 AJLR |
+ 
+ 退出码：`0` 成功；`2` 参数或调用失败；`3` 当前内核没有 `SCHED_YAT_CASCHED`。
+ 
+@@ -76,6 +107,10 @@ cd linux-6.8-main/yat_test_scripts
+ # 性能对比：自动跑 CFS 与 YAT 两轮 QEMU，产出 CSV
+ ./compare_cfs_vs_yat.sh --iters 2000000
+ 
++# 验证 AJLR（A8）：必须可跨核 + 有唤醒
++./compare_cfs_vs_yat.sh --tasks 8 --iters 2000000 \\
++                        --affinity none --sleep-us 200 --timeout 300
++
+ # 或者从仓库根目录用 Makefile
+ make kernel-compare
+ ```
+diff --git a/linux-6.8-main/yat_test_scripts/start_test_environment.sh b/linux-6.8-main/yat_test_scripts/start_test_environment.sh
+index 3d95892ae..99f108047 100755
+--- a/linux-6.8-main/yat_test_scripts/start_test_environment.sh
++++ b/linux-6.8-main/yat_test_scripts/start_test_environment.sh
+@@ -1,4 +1,4 @@
+-#!/bin/bash
++ig#!/bin/bash
+ #
+ # 一键启动「交互式」Yat-CAShed 测试环境（进 shell 手动跑命令、看 proc/debugfs）。
+ #
+diff --git a/patches/0005-test-env.patch b/patches/0005-test-env.patch
+index 401c03eab..7bfb2f8a2 100644
+--- a/patches/0005-test-env.patch
++++ b/patches/0005-test-env.patch
+@@ -4,7 +4,7 @@ Upstream: linux v6.8 (torvalds)
+ 
+ --- /dev/null
+ +++ b/boot_test_scripts/README.md
+-@@ -0,0 +1,102 @@
++@@ -0,0 +1,137 @@
+ +# Yat-CAShed 用户态测试程序（只放 C 源码）
+ +
+ +## 目录约定（重要）
+@@ -43,25 +43,56 @@ Upstream: linux v6.8 (torvalds)
+ +打印每个进程的 PID、`sched_getcpu()` 结果与策略设置返回值。用途是**功能性验证**：
+ +调度类是否注册、`sched_setattr` 是否被接受、任务是否真的被调度到 CPU 上。
+ +
+-+### `yat_bench.c` —— 快不快
+++### `yat_bench.c` —— 快不快，以及 AJLR 有没有生效
+ +
+-+同一份固定工作量（LCG + 异或混合，避免被编译器优化掉），在指定 CPU 上跑 `iters` 次，
+-+N 个子进程并行，父进程通过 pipe 收回每个子进程的墙钟时间，聚合成一行 CSV：
+++同一份固定工作量（LCG + 异或混合，避免被编译器优化掉），N 个子进程并行跑 `iters` 次，
+++父进程通过 pipe 收回每个子进程的墙钟时间，聚合成一行 CSV。
+++
+++#### 命令行参数
+++
+++| 参数 | 默认 | 说明 |
+++|------|------|------|
+++| `--policy cfs\\|yat` | `cfs` | 目标策略（由内核命令行 `yatbench=` 传入，保证同一二进制） |
+++| `--tasks N` | 4 | 并发子进程数（上限 `MAX_TASKS`） |
+++| `--iters M` | 20000000 | 每个子进程的固定迭代次数 |
+++| `--cpu C` | 0 | `--affinity shared` 时 pin 到哪个物理 CPU |
+++| `--affinity shared\\|none\\|spread` | `shared` | 亲和性模式，见下表 |
+++| `--sleep-us U` | 0 | 每段计算后 `nanosleep` U 微秒，制造真实唤醒；计算固定切 64 段 |
+++| `--verbose` | 关 | 逐阶段打印 `YTASK` 标记，仅用于 guest 挂死时定位 |
+++
+++亲和性模式的区别（**这条直接决定能不能测到 AJLR**）：
+++
+++| 模式 | 行为 | `nr_cpus_allowed` | 能测什么 |
+++|------|------|-------------------|----------|
+++| `shared` | 全部 pin 到 `--cpu` | 1 | 同核竞争下的时间片分配；**测不到 AJLR**（`core.c` 的包装层直接 `cpumask_any()` 返回，不调用调度类） |
+++| `none` | 不设亲和性 | 在线 CPU 数 | 跨核放置；A8 验证**必须**用这个 |
+++| `spread` | 第 i 个任务 pin 到 CPU `i % 在线数` | 1 | 强制初始分散，观察是否会被重新收敛 |
+++
+++> 另外 `--sleep-us 0` 时任务从不阻塞，只有 `WF_FORK`，而
+++> `select_task_rq_yat_casched()` 刻意在非 `WF_TTWU` 早退 —— 所以
+++> **验证 AJLR 必须同时满足 `--affinity none` 与 `--sleep-us > 0`**。
+++> 早期版本把任务固定 pin 到单核且从不阻塞，两个条件同时不成立，
+++> 这正是历史上「`jobs_placed` 恒 0」的直接原因（详见仓库
+++> [`docs/ROADMAP.md`](../../docs/ROADMAP.md) §A8.1）。
+++
+++#### 输出
+ +
+ +```
+-+YATCSV,policy,tasks,iters,cpu,sum_wall_ns,min_wall_ns,max_wall_ns,sum_work_units,vol_ctx,invol_ctx,cpus_online
+++YATCSV,policy,tasks,iters,cpu,sum_wall_ns,min_wall_ns,max_wall_ns,sum_work_units,
+++       vol_ctx,invol_ctx,cpus_online,affinity,sleep_us
+ +```
+ +
+-+字段含义：
+++（实际是一行，这里为可读性折行；共 **13 列**。）
+ +
+ +| 字段 | 说明 |
+ +|------|------|
+ +| `policy` | `cfs` 或 `yat`（由内核命令行 `yatbench=` 传入） |
+-+| `sum_wall_ns` | N 个子进程墙钟时间之和（ns） |
+++| `sum_wall_ns` | N 个子进程墙钟时间之和（ns），**主指标** |
+ +| `min/max_wall_ns` | 单个子进程的最快 / 最慢墙钟时间（反映离散度） |
+ +| `sum_work_units` | 校验和：应为 `tasks × iters`，用于确认真的跑完了 |
+ +| `vol_ctx` / `invol_ctx` | 自愿 / 非自愿上下文切换次数（读 `/proc/self/status`） |
+ +| `cpus_online` | guest 内 `_SC_NPROCESSORS_ONLN`；**必须 > 1**，否则对比无意义 |
+++| `affinity` / `sleep_us` | A8 阶段追加的自描述列（加在行尾，旧列位置不变），用于事后判断这组数据能否评价 AJLR |
+ +
+ +退出码：`0` 成功；`2` 参数或调用失败；`3` 当前内核没有 `SCHED_YAT_CASCHED`。
+ +
+@@ -83,6 +114,10 @@ Upstream: linux v6.8 (torvalds)
+ +# 性能对比：自动跑 CFS 与 YAT 两轮 QEMU，产出 CSV
+ +./compare_cfs_vs_yat.sh --iters 2000000
+ +
+++# 验证 AJLR（A8）：必须可跨核 + 有唤醒
+++./compare_cfs_vs_yat.sh --tasks 8 --iters 2000000 \\
+++                        --affinity none --sleep-us 200 --timeout 300
+++
+ +# 或者从仓库根目录用 Makefile
+ +make kernel-compare
+ +```
+diff --git a/patches/MANIFEST.sha256 b/patches/MANIFEST.sha256
+index 4d1eebac0..87801b3d1 100644
+--- a/patches/MANIFEST.sha256
++++ b/patches/MANIFEST.sha256
+@@ -2,5 +2,5 @@ fdeb0ab63c3734c21f8dc221a0098ebd9189c858cc658b2df5f422d6c6f5151f  0001-sched-yat
+ a418b88ff6ec2bea1618eeb600d780dc6682c66b48875fde5741f8ccf554ba86  0002-sched-yat-casched-integration.patch
+ e92a6a704d4506ca292ea6bddb1ec374de6148a6dd5a9220b6f6f70b88ae20b7  0003-x86-realmode-tolerate-missing-trampoline.patch
+ 977ccf2e8e28c0089d5517f015a23bf4ebed924b1e16f88abd0b1f4fea79c077  0004-kernel-gitignore.patch
+-9f604e4b39adaf991768d34e8a04a0a79bdb03e486979df81706c5dc913e2d37  0005-test-env.patch
++cf248f0a3b1d27b5b5ae081c72c6dc152de2f1614fcc3386333067ef0852e025  0005-test-env.patch
+ e0f8a23ba3f33ce941ab4767cf5f2a904db901d40bf46479daeed2f88935cc0b  0006-docs.patch
+diff --git a/report/paper/Yat-CAShed.pdf b/report/paper/Yat-CAShed.pdf
+index 684670d49..ae90d9f8f 100644
+Binary files a/report/paper/Yat-CAShed.pdf and b/report/paper/Yat-CAShed.pdf differ
+diff --git a/report/paper/Yat-CAShed.tex b/report/paper/Yat-CAShed.tex
+index dec9e1f88..eb3a06f9a 100644
+--- a/report/paper/Yat-CAShed.tex
++++ b/report/paper/Yat-CAShed.tex
+@@ -1,13 +1,13 @@
+ \documentclass[a4paper]{article}
+ 
+-\usepackage[UTF8]{ctex}
++\usepackage[UTF8,fontset=fandol]{ctex}
+ \usepackage[a4paper,margin=1in]{geometry}
+ \usepackage{graphicx}
+ \usepackage{float}
+ \usepackage{fancyvrb}           % 支持中文代码块
+ \usepackage{longtable}
+ \usepackage{booktabs}
+-\usepackage{hyperref}
++\usepackage[hidelinks]{hyperref}
+ \usepackage{fancyhdr}
+ \usepackage{lastpage}
+ \usepackage{color}
+@@ -70,7 +70,9 @@
+ \begin{document}
+ 
+ % 封面
++\hypersetup{pageanchor=false}
+ \input{cover.tex}
++\hypersetup{pageanchor=true}
+ 
+ % 摘要
+ \input{abstract.tex}
+diff --git a/report/paper/abstract.tex b/report/paper/abstract.tex
+index 78920be6a..bee3dd324 100644
+--- a/report/paper/abstract.tex
++++ b/report/paper/abstract.tex
+@@ -1,8 +1,4 @@
+-% 摘要章节
+-% 负责人：林炜东
+-
+ \section*{摘要}
++本文研究多核系统中缓存亲和性与负载均衡之间的权衡，介绍 Yat-CAShed 的缓存感知调度原型、Java 分配模拟器及 Linux 6.8 调度类集成。设计借鉴缓存重用距离与 Cache Recency Profile，通过任务历史信息辅助核心选择。实验方法区分统一模型下的分配比较、内核路径功能验证和真实系统性能评估，并明确模型指标与硬件测量的区别。现有内核历史记录表明相关决策路径能够被触发，但尚未建立优于 CFS 的性能证据；本文不据此宣称普遍性能优势或硬实时保证。后续验证需要版本化原始数据、多种子配对实验以及真实平台重复测量。
+ 
+-本文档详细介绍了Yat-CASched（面向多核实时系统的轻量化缓存感知型调度方法）的设计与实现。Yat-CASched是一种创新的缓存感知分配算法，专门设计用于多核系统中有向无环图(DAG)任务的高效调度。该算法通过引入缓存重用距离(Cache Recency)的概念，结合Cache Recency Profile (CRP)模型来预测作业在特定核心上的执行时间改进情况，实现了系统级别的缓存性能优化。本项目在理论基础上实现了完整的调度器原型系统，并通过详尽的测试验证了算法的有效性和优越性。
+-
+-\textbf{关键词：}实时系统、多核调度、缓存感知、DAG任务、性能优化
++\textbf{关键词：}多核调度；缓存感知；内核原型；可复现实验；性能评估
+\ No newline at end of file
+diff --git a/report/paper/chapter1-intro.tex b/report/paper/chapter1-intro.tex
+index b63d6ecab..649e9bc43 100644
+--- a/report/paper/chapter1-intro.tex
++++ b/report/paper/chapter1-intro.tex
+@@ -21,7 +21,7 @@
+ \subsection{项目创新点}
+ 
+ \begin{itemize}
+-    \item 首次提出基于缓存重用距离的DAG任务调度方法
++    \item 基于缓存重用距离研究DAG任务分配方法
+     \item 设计了轻量化的Cache Recency Profile (CRP)预测模型
+     \item 实现了高效的在线调度算法，时间复杂度优化至$O(m^2 + m \times (m \times n))$
+     \item 提供了完整的系统实现和性能评估框架
+diff --git a/report/paper/chapter3-design.tex b/report/paper/chapter3-design.tex
+index 972951ede..3962a47ac 100644
+--- a/report/paper/chapter3-design.tex
++++ b/report/paper/chapter3-design.tex
+@@ -4,6 +4,7 @@
+ \section{整体框架} \label{sec:design}
+ 
+ \subsection{系统架构}
++本章是概念架构，结构体与函数名用于说明职责，不是当前源码的逐字接口；Java 实体与内核数据结构分别以对应源码为准。
+ 
+ Yat-CASched调度器采用分层架构设计，主要包括以下模块：
+ 
+diff --git a/report/paper/chapter4-theory.tex b/report/paper/chapter4-theory.tex
+index 08b070f65..d6f99c17f 100644
+--- a/report/paper/chapter4-theory.tex
++++ b/report/paper/chapter4-theory.tex
+@@ -15,29 +15,12 @@
+ 
+ \subsection{算法概述}
+ 
+-Yat-CASched是一种创新的缓存感知分配算法，专门设计用于多核系统中有向无环图(DAG)任务的高效调度。该算法的核心思想是通过预测模型来估算作业在不同核心上的执行时间加速比，并基于此进行最优的核心分配决策，从而最大化缓存利用率并减少DAG任务的完成时间。
++Yat-CASched是一种创新的缓存感知分配算法，专门设计用于多核系统中有向无环图(DAG)任务的高效调度。该算法的核心思想是通过预测模型来估算作业在不同核心上的执行时间加速比，并基于此进行基于预测收益的核心分配决策，从而最大化缓存利用率并减少DAG任务的完成时间。
+ 
+ 算法的主要创新在于引入了缓存重用距离(Cache Recency)的概念，通过Cache Recency Profile (CRP)模型来预测作业在特定核心上的执行时间改进情况，实现了系统级别的缓存性能优化。
+ 
+ % 图片预留位置：Yat-CASched算法整体架构图
+-\begin{figure}[htbp]
+-\centering
+-% \includegraphics[width=0.8\textwidth]{img/yat_casched_overview.png}
+-\begin{tcolorbox}[
+-    colback=gray!10,
+-    colframe=gray!50,
+-    width=0.8\textwidth,
+-    center,
+-    arc=3pt
+-]
+-\centering
+-\textbf{[图片预留位置]}\\
+-\textbf{Yat-CASched算法整体架构图}\\
+-\footnotesize{展示算法的核心组件：CRP模型、MSF/LCIF规则、调度决策流程}
+-\end{tcolorbox}
+-\caption{Yat-CASched算法整体架构}
+-\label{fig:yat_overview}
+-\end{figure}
++
+ 
+ \begin{tcolorbox}[
+     colback=blue!5!white,
+@@ -47,9 +30,9 @@ Yat-CASched是一种创新的缓存感知分配算法，专门设计用于多核
+     arc=3pt
+ ]
+ \begin{itemize}
+-    \item \textbf{缓存重用距离建模}：首次将缓存重用距离概念引入DAG任务调度
++    \item \textbf{缓存重用距离建模}：使用缓存重用距离描述DAG作业历史
+     \item \textbf{CRP预测模型}：基于历史数据预测任务在不同核心上的性能表现
+-    \item \textbf{双重优化策略}：MSF和LCIF规则协同工作，实现全局最优调度
++    \item \textbf{双重优化策略}：MSF和LCIF规则协同工作，构造启发式调度方案
+     \item \textbf{实时调度决策}：低开销的在线算法，适合实际系统部署
+ \end{itemize}
+ \end{tcolorbox}
+@@ -61,24 +44,7 @@ Yat-CASched是一种创新的缓存感知分配算法，专门设计用于多核
+ 系统包含$m$个同构核心$\Lambda = \{\lambda_1, \lambda_2, ..., \lambda_m\}$和$\eta$层包容式缓存层次结构$L = \{L_1, L_2, ..., L_\eta\}$。在包容式缓存中，$L_1$缓存的内容同时存在于$L_2$和$L_3$缓存中。
+ 
+ % 图片预留位置：多级缓存架构图
+-\begin{figure}[htbp]
+-\centering
+-% \includegraphics[width=0.9\textwidth]{img/cache_hierarchy.png}
+-\begin{tcolorbox}[
+-    colback=gray!10,
+-    colframe=gray!50,
+-    width=0.9\textwidth,
+-    center,
+-    arc=3pt
+-]
+-\centering
+-\textbf{[图片预留位置]}\\
+-\textbf{多核系统缓存层次结构图}\\
+-\footnotesize{展示L1、L2、L3缓存的层次关系和核心间的共享模式}
+-\end{tcolorbox}
+-\caption{多核系统缓存层次结构}
+-\label{fig:cache_hierarchy}
+-\end{figure}
++
+ 
+ 典型的三层缓存架构中：
+ \begin{tcolorbox}[
+@@ -125,24 +91,7 @@ $$\tau_i = \{G_i = (v_i, E_i), T_i, P_i, w_i\}$$
+ 每个节点$u_{i,j} \in v_i$具有最坏情况执行时间(WCET) $C_{i,j}$。作业(job)表示DAG某次释放中的节点实例，记为$u_{i,j,v}$，其中$v$表示第$v$次释放。
+ 
+ % 图片预留位置：DAG任务示例图
+-\begin{figure}[htbp]
+-\centering
+-% \includegraphics[width=0.8\textwidth]{img/dag_task_example.png}
+-\begin{tcolorbox}[
+-    colback=gray!10,
+-    colframe=gray!50,
+-    width=0.8\textwidth,
+-    center,
+-    arc=3pt
+-]
+-\centering
+-\textbf{[图片预留位置]}\\
+-\textbf{DAG任务结构示例}\\
+-\footnotesize{展示典型的DAG任务节点依赖关系和执行时间标注}
+-\end{tcolorbox}
+-\caption{DAG任务结构示例}
+-\label{fig:dag_example}
+-\end{figure}
++
+ 
+ \subsection{缓存重用距离与预测模型}
+ 
+@@ -189,24 +138,7 @@ $$r(u_j, L_x) = g(t(u_{j,v}) - t(u_{j,v-1}), L_x)$$
+ 其中$g(\cdot)$函数表示在时间间隔内其他任务执行时间的总和。
+ 
+ % 图片预留位置：缓存重用距离时间关系图
+-\begin{figure}[htbp]
+-\centering
+-% \includegraphics[width=0.85\textwidth]{img/cache_recency_timeline.png}
+-\begin{tcolorbox}[
+-    colback=gray!10,
+-    colframe=gray!50,
+-    width=0.85\textwidth,
+-    center,
+-    arc=3pt
+-]
+-\centering
+-\textbf{[图片预留位置]}\\
+-\textbf{缓存重用距离与时间关系示意图}\\
+-\footnotesize{展示任务执行时间轴上的缓存重用距离计算过程}
+-\end{tcolorbox}
+-\caption{缓存重用距离与时间关系}
+-\label{fig:cache_recency_timeline}
+-\end{figure}
++
+ 
+ \subsubsection{Cache Recency Profile (CRP)模型}
+ 
+@@ -240,24 +172,7 @@ CRP模型通过测量不同重用距离值下的实际执行时间来学习获
+ \end{tcolorbox}
+ 
+ % 图片预留位置：CRP模型曲线图
+-\begin{figure}[htbp]
+-\centering
+-% \includegraphics[width=0.8\textwidth]{img/crp_model_curve.png}
+-\begin{tcolorbox}[
+-    colback=gray!10,
+-    colframe=gray!50,
+-    width=0.8\textwidth,
+-    center,
+-    arc=3pt
+-]
+-\centering
+-\textbf{[图片预留位置]}\\
+-\textbf{CRP模型加速比曲线}\\
+-\footnotesize{展示不同缓存级别下加速比与重用距离的关系曲线}
+-\end{tcolorbox}
+-\caption{CRP模型加速比曲线}
+-\label{fig:crp_curve}
+-\end{figure}
++
+ 
+ \subsection{核心分配机制}
+ 
+@@ -322,7 +237,7 @@ Yat-CASched算法在每个调度点执行以下步骤：
+ 
+ 2. \textbf{加速表构建}：计算每个待分派作业在每个空闲核心上的加速比$S(\cdot)$
+ 
+-3. \textbf{最优分配决策}：
++3. \textbf{启发式分配决策}：
+    \begin{itemize}
+        \item 应用MSF规则选择具有最高加速比的作业-核心对
+        \item 如果存在多个相同加速比的候选核心，应用LCIF规则选择影响最小的核心
+@@ -359,233 +274,11 @@ Yat-CASched算法在每个调度点执行以下步骤：
+ \end{tcolorbox}
+ 
+ % 图片预留位置：Java实验平台架构图
+-\begin{figure}[htbp]
+-\centering
+-% \includegraphics[width=0.9\textwidth]{img/java_platform_architecture.png}
+-\begin{tcolorbox}[
+-    colback=gray!10,
+-    colframe=gray!50,
+-    width=0.9\textwidth,
+-    center,
+-    arc=3pt
+-]
+-\centering
+-\textbf{[图片预留位置]}\\
+-\textbf{Java实验平台完整架构图}\\
+-\footnotesize{展示实验控制器、算法模块、性能分析器、可视化工具的整体架构}
+-\end{tcolorbox}
+-\caption{Java实验平台完整架构}
+-\label{fig:java_platform}
+-\end{figure}
+-
+-\subsubsection{大规模实验验证}
+-
+-我们实施了一次规模空前的算法性能对比实验，通过98个测试案例的大样本统计分析，获得了具有统计显著性的实验结果。
+-
+-\begin{tcolorbox}[
+-    colback=green!5!white,
+-    colframe=green!50!black,
+-    title=\textbf{实验配置参数},
+-    fonttitle=\bfseries,
+-    arc=3pt
+-]
+-\begin{itemize}
+-    \item \textbf{处理器核心数}：8核（模拟现代多核处理器）
+-    \item \textbf{测试案例总数}：98个（大规模统计显著性验证）
+-    \item \textbf{每案例任务数}：50个（中等复杂度任务集）
+-    \item \textbf{利用率级别}：[0.4, 0.6, 0.8, 1.0, 1.2, 1.5, 2.0]（覆盖轻载到重载）
+-    \item \textbf{缓存层次建模}：三级缓存 + 完整内存访问建模
+-    \item \textbf{任务生成算法}：UUnifastDiscard确保利用率分布合理性
+-\end{itemize}
+-\end{tcolorbox}
+-
+-\subsubsection{Cache-Aware算法实现验证}
+-
+-我们成功实现了完整的Cache-Aware Resource Variable算法，其核心创新包括：
+-
+-\textbf{1. 缓存感知评分机制}
+-\begin{tcolorbox}[
+-    colback=lightblue!10!white,
+-    colframe=blue!50!black,
+-    arc=3pt
+-]
+-\begin{itemize}
+-    \item \textbf{缓存敏感度权重} (40\%)：根据任务的缓存访问特性动态调整
+-    \item \textbf{处理器亲和性权重} (30\%)：优化任务与处理器的匹配度
+-    \item \textbf{负载均衡权重} (20\%)：保持系统负载分布合理性
+-    \item \textbf{缓存层次优化权重} (10\%)：考虑L1/L2/L3缓存共享特性
+-\end{itemize}
+-\end{tcolorbox}
+-
+-\textbf{2. 智能任务分类与处理}
+-\begin{tcolorbox}[
+-    colback=orange!10!white,
+-    colframe=orange!50!black,
+-    arc=3pt
+-]
+-\begin{itemize}
+-    \item \textbf{计算密集型任务}（敏感度0.2-0.4）：优先考虑负载均衡
+-    \item \textbf{数据密集型任务}（敏感度0.6-0.8）：平衡缓存亲和性与负载分布  
+-    \item \textbf{内存密集型任务}（敏感度0.8-1.0）：最大化缓存命中率优化
+-\end{itemize}
+-\end{tcolorbox}
+-
+-\subsubsection{实验结果与性能验证}
+ 
+-经过98个测试案例的全面验证，Cache-Aware算法展现出显著的性能优势：
+ 
+-\begin{tcolorbox}[
+-    colback=yellow!5!white,
+-    colframe=orange!75!black,
+-    title=\textbf{核心实验成果},
+-    fonttitle=\bfseries,
+-    arc=3pt
+-]
+-\begin{itemize}
+-    \item \textbf{算法胜率}：\textcolor{red}{\textbf{94.9\%}}（93/98测试案例胜出）
+-    \item \textbf{缓存命中率提升}：\textcolor{red}{\textbf{+50.4\%}}（从50.0\%提升到75.2\%）
+-    \item \textbf{能耗降低}：\textcolor{red}{\textbf{-9.92\%}}（从684.99降低到617.04）
+-    \item \textbf{统计显著性}：p-value < 0.001（极高统计显著性）
+-\end{itemize}
+-\end{tcolorbox}
+-
+-\textbf{详细性能指标对比}
+-
+-\begin{table}[htbp]
+-\centering
+-\caption{Cache-Aware vs WFD算法性能对比结果}
+-\label{tab:performance_comparison}
+-\begin{tabular}{|l|c|c|c|}
+-\hline
+-\textbf{性能指标} & \textbf{WFD算法} & \textbf{Cache-Aware算法} & \textbf{改进幅度} \\
+-\hline
+-平均完成时间 & 1750034834593.91 & 1750034834590.90 & +0.00017\% \\
+-\hline
+-缓存命中率 & 50.0\% & \textcolor{red}{\textbf{75.2\%}} & \textcolor{red}{\textbf{+50.4\%}} \\
+-\hline
+-负载均衡度 & 81.951\% & -164.575\%* & 权衡优化 \\
+-\hline
+-能耗 & 684.99 & \textcolor{red}{\textbf{617.04}} & \textcolor{red}{\textbf{-9.92\%}} \\
+-\hline
+-缓存敏感度收益 & 0\% & \textcolor{red}{\textbf{11.443\%}} & 新增优化 \\
+-\hline
+-\end{tabular}
+-\end{table}
+-
+-*注：负载均衡度为负值表示算法为优化缓存性能而适当权衡了负载分布
+-
+-% 图片预留位置：性能对比结果图
+-\begin{figure}[htbp]
+-\centering
+-% \includegraphics[width=0.85\textwidth]{img/performance_comparison_results.png}
+-\begin{tcolorbox}[
+-    colback=gray!10,
+-    colframe=gray!50,
+-    width=0.85\textwidth,
+-    center,
+-    arc=3pt
+-]
+-\centering
+-\textbf{[图片预留位置]}\\
+-\textbf{算法性能对比实验结果图}\\
+-\footnotesize{展示缓存命中率、能耗、胜率等关键指标的对比结果}
+-\end{tcolorbox}
+-\caption{算法性能对比实验结果}
+-\label{fig:performance_results}
+-\end{figure}
+-
+-\subsubsection{专业级可视化分析工具}
+-
+-为支持实验结果的深度分析，我们开发了完整的Python可视化分析工具链：
+-
+-\begin{tcolorbox}[
+-    colback=purple!5!white,
+-    colframe=purple!50!black,
+-    title=\textbf{可视化工具技术特色},
+-    fonttitle=\bfseries,
+-    arc=3pt
+-]
+-\textbf{1. 自动化数据分析}
+-\begin{itemize}
+-    \item 基础统计分析：平均值、标准差、改进百分比自动计算
+-    \item 胜负分析：逐案例比较，自动计算胜率统计
+-    \item 趋势分析：性能变化趋势智能识别
+-\end{itemize}
+-
+-\textbf{2. 专业级图表生成}
+-\begin{itemize}
+-    \item 对比柱状图：多维度性能指标可视化
+-    \item 胜率饼图：算法优势直观展示
+-    \item 趋势线图：测试案例性能变化轨迹
+-    \item 热力图：详细性能矩阵分析（完整版）
+-\end{itemize}
+-
+-\textbf{3. 科学严谨性保证}
+-\begin{itemize}
+-    \item 统计显著性验证：基于98个样本的大规模分析
+-    \item 可重现性：标准化分析流程和结果输出
+-    \item 透明性：开源代码，所有计算过程可审查
+-\end{itemize}
+-\end{tcolorbox}
+-
+-\subsubsection{算法适用性分析}
++\subsubsection{实验验证范围与待证假设}
++原稿所列 98 个用例、94.9\% 胜率和缓存命中率相对提升 50.4\% 缺少对应版本与原始结果的可追溯关联，已从正文移至仓库历史归档，不作为当前模型的实验结论。实验协议、指标定义与有效性边界统一见第\ref{sec:test}节。
+ 
+-基于实验结果，Cache-Aware算法特别适用于以下场景：
++MSF 与 LCIF 是基于预测收益的启发式选择规则。局部评分较优不能推出全局最优；若要建立近似界或实时可调度性保证，必须补充任务模型、预测误差界、干扰假设及形式化证明。当前实现没有提供上述证明。
+ 
+-\begin{tcolorbox}[
+-    colback=cyan!5!white,
+-    colframe=cyan!50!black,
+-    title=\textbf{算法优势应用场景},
+-    fonttitle=\bfseries,
+-    arc=3pt
+-]
+-\begin{itemize}
+-    \item \textbf{多核处理器系统}：充分利用现代多核架构的缓存层次结构
+-    \item \textbf{缓存敏感应用}：数据密集型、内存密集型工作负载
+-    \item \textbf{能耗敏感环境}：移动设备、嵌入式系统等对能耗有严格要求
+-    \item \textbf{高性能计算场景}：科学计算、实时系统等对性能要求极高的场景
+-\end{itemize}
+-\end{tcolorbox}
+-
+-\subsubsection{实验工具链完整性验证}
+-
+-我们的Java实验平台和Python可视化工具已经过充分验证：
+-
+-\textbf{1. Java实验平台验证状态}
+-\begin{itemize}
+-    \item \textcolor{green}{\textbf{\checkmark}} 编译系统：支持完整项目构建和依赖管理
+-    \item \textcolor{green}{\textbf{\checkmark}} 算法实现：Cache-Aware和WFD算法功能完整
+-    \item \textcolor{green}{\textbf{\checkmark}} 实验控制：98个测试案例成功执行
+-    \item \textcolor{green}{\textbf{\checkmark}} 数据导出：CSV格式实验结果可正确生成
+-\end{itemize}
+-
+-\textbf{2. Python可视化工具验证状态}
+-\begin{itemize}
+-    \item \textcolor{green}{\textbf{\checkmark}} 简化版工具：已验证可独立运行，生成基础图表
+-    \item \textcolor{green}{\textbf{\checkmark}} 完整版工具：支持高级统计分析和专业图表
+-    \item \textcolor{green}{\textbf{\checkmark}} 图表输出：自动生成高清PNG格式图表文件
+-    \item \textcolor{green}{\textbf{\checkmark}} 批处理支持：一键启动脚本简化用户操作
+-\end{itemize}
+-
+-\begin{tcolorbox}[
+-    colback=green!5!white,
+-    colframe=green!50!black,
+-    title=\textbf{实验验证总结},
+-    fonttitle=\bfseries,
+-    arc=3pt
+-]
+-\textbf{核心成就}：
+-\begin{itemize}
+-    \item 通过98个测试案例验证了Cache-Aware算法的显著优势
+-    \item 94.9\%的胜率证明了算法的稳定性和可靠性
+-    \item 50.4\%的缓存命中率提升展现了缓存感知调度的价值
+-    \item 建立了完整的算法验证工具链，具有很强的可重现性
+-\end{itemize}
+-
+-\textbf{科学意义}：
+-\begin{itemize}
+-    \item 为Yat-CASched理论算法提供了强有力的实验支撑
+-    \item 证明了缓存感知调度在现代多核系统中的实际价值
+-    \item 为后续的Linux内核实现奠定了坚实的理论和实验基础
+-\end{itemize}
+-\end{tcolorbox}
++模拟器用于检验分配策略在给定模型下的行为，内核原型用于检验调度框架集成。二者的状态表示、时间推进与运行开销不同，因此仿真结果不能直接推导内核性能。后续实验应分别验证模型敏感性、种子间波动、内核正确性及真实平台代价。
+\ No newline at end of file
+diff --git a/report/paper/chapter5-kernel.tex b/report/paper/chapter5-kernel.tex
+index 3d1e06f1c..a069b7e54 100644
+--- a/report/paper/chapter5-kernel.tex
++++ b/report/paper/chapter5-kernel.tex
+@@ -1,331 +1,42 @@
+-% 第五章：Linux内核实现
++\section{Linux 内核实现与可验证接口}
++\subsection{实现范围}
++本项目在 Linux 6.8 源码中集成内置调度类，而非可动态装卸的内核模块。策略编号为 8，配置项为 \texttt{CONFIG\_SCHED\_CLASS\_YAT\_CASCHED}。内核实现的事实来源是 \texttt{kernel/sched/yat\_casched.c} 及对应头文件；本章描述其设计关系，不将示意代码冒充完整实现。
+ 
+-\newpage
+-\section{Linux内核实现} \label{sec:kernel}
++\subsection{状态与数据结构}
++实现维护作业状态、CPU 历史记录与任务--核心加速表。加速条目包含任务标识、核心标识、预测收益、WCET 与定点 CRP 比率。历史表按 CPU 保存记录并设置锁与记录数量字段。其目的在于为核心选择提供历史信息，同时限制记录增长；是否达到期望的最坏开销上界仍需压力测试。锁保护与清理路径的存在不等同于已证明无死锁、无悬空引用或无饥饿。
+ 
+-本章详细介绍Yat-CASched算法在Linux内核中的具体实现过程。基于第四章提出的简化缓存感知策略，我们开发了一个完整的内核调度类，将理论算法转化为可在生产环境中运行的系统组件。
++\subsection{唤醒、选核与执行链路}
++调度类通过 \texttt{DEFINE\_SCHED\_CLASS} 注册。核心选择回调在唤醒路径使用历史与预测信息；非唤醒路径直接回退。仅允许一个 CPU 的任务可能由调度核心直接完成选核，因此固定单核负载不能用来检验 AJLR 的跨核决策。测试必须允许跨核，并通过阻塞与唤醒触发相关路径。
+ 
+-\subsection{实现概述}
+-
+-基于简化的缓存感知策略，我们开发了一个名为\texttt{Yat\_Casched}的Linux内核调度类。该实现将简单缓存感知算法直接集成到操作系统内核中，专注于保持任务在其上次运行的CPU上执行。
+-
+-\begin{tcolorbox}[
+-    colback=blue!5!white,
+-    colframe=blue!50!black,
+-    title=\textbf{内核实现核心目标},
+-    fonttitle=\bfseries,
+-    arc=3pt
+-]
+-\textbf{实现目标}：将理论算法转化为可在生产环境中运行的内核模块\\
+-\textbf{设计原则}：轻量级、高效率、兼容性好\\
+-\textbf{技术路径}：基于Linux CFS调度框架，最小化修改，最大化效果
+-\end{tcolorbox}
+-
+-\subsection{调度策略集成}
+-
+-我们在Linux内核中新增了调度策略\texttt{SCHED\_YAT\_CASCHED = 8}，作为非实时调度器的一种扩展：
+-
+-\begin{tcolorbox}[
+-    colback=lightgreen!10!white,
+-    colframe=green!50!black,
+-    title=\textbf{调度策略参数配置},
+-    fonttitle=\bfseries,
+-    arc=3pt
+-]
+-\begin{itemize}
+-    \item \textbf{调度策略ID}：\texttt{SCHED\_YAT\_CASCHED = 8}
+-    \item \textbf{优先级设置}：非实时调度器，使用优先级0
+-    \item \textbf{CPU亲和性}：倾向于保持任务在上次运行的CPU上
+-    \item \textbf{设计理念}：轻量级实现，最小化调度开销
+-\end{itemize}
+-\end{tcolorbox}
+-
+-\subsection{内核数据结构设计}
+-
+-为支持Yat-CASched调度算法，我们在内核中定义了专门的数据结构：
+-
+-\begin{tcolorbox}[
+-    colback=yellow!5!white,
+-    colframe=orange!50!black,
+-    title=\textbf{核心数据结构实现},
+-    fonttitle=\bfseries,
+-    arc=3pt
+-]
+-\begin{code}
+-// 每个任务的调度实体结构
+-struct sched_yat_casched_entity {
+-    u64 slice;           // 时间片长度
+-    int last_cpu;        // 上次运行的CPU编号
+-};
+-
+-// 每个CPU的运行队列结构  
+-struct yat_casched_rq {
+-    struct task_struct *agent;  // 当前代理任务指针
+-};
+-\end{code}
+-\end{tcolorbox}
+-
+-这些结构体被集成到Linux内核的任务调度框架中，通过条件编译\texttt{CONFIG\_SCHED\_CLASS\_YAT\_CASCHED}进行控制。
+-
+-% 图片预留位置：内核数据结构关系图
+-\begin{figure}[htbp]
+-\centering
+-% \includegraphics[width=0.85\textwidth]{img/kernel_data_structure.png}
+-\begin{tcolorbox}[
+-    colback=gray!10,
+-    colframe=gray!50,
+-    width=0.85\textwidth,
+-    center,
+-    arc=3pt
+-]
+-\centering
+-\textbf{[图片预留位置]}\\
+-\textbf{内核数据结构关系图}\\
+-\footnotesize{展示调度实体、运行队列与Linux调度框架的集成关系}
+-\end{tcolorbox}
+-\caption{内核数据结构关系}
+-\label{fig:kernel_structure}
+-\end{figure}
+-
+-\subsection{调度类接口实现}
+-
+-Yat-CASched调度类实现了Linux内核调度框架要求的所有接口函数：
+-
+-\begin{tcolorbox}[
+-    colback=lightblue!5!white,
+-    colframe=blue!50!black,
+-    title=\textbf{调度类完整接口定义},
+-    fonttitle=\bfseries,
+-    arc=3pt
+-]
+-\begin{code}
+-// 调度类定义 - Linux内核调度接口
+-DEFINE_SCHED_CLASS(yat_casched) = {
+-    .enqueue_task       = enqueue_task_yat_casched,    // 任务入队
+-    .dequeue_task       = dequeue_task_yat_casched,    // 任务出队
+-    .yield_task         = yield_task_yat_casched,      // 任务让出
+-    .yield_to_task      = yield_to_task_yat_casched,   // 让出给指定任务
+-    .wakeup_preempt     = wakeup_preempt_yat_casched,  // 唤醒抢占
+-    .pick_next_task     = pick_next_task_yat_casched,  // 选择下一个任务
+-    .put_prev_task      = put_prev_task_yat_casched,   // 放置前一个任务
+-    .set_next_task      = set_next_task_yat_casched,   // 设置下一个任务
+-#ifdef CONFIG_SMP
+-    .balance            = balance_yat_casched,         // SMP负载均衡
+-    .select_task_rq     = select_task_rq_yat_casched,  // 选择运行队列
+-    .set_cpus_allowed   = set_cpus_allowed_yat_casched,// 设置CPU亲和性
+-    .rq_online          = rq_online_yat_casched,       // 队列上线
+-    .rq_offline         = rq_offline_yat_casched,      // 队列下线
+-#endif
+-    .pick_task          = pick_task_yat_casched,       // 选择任务
+-    .task_tick          = task_tick_yat_casched,       // 任务时钟滴答
+-    .switched_to        = switched_to_yat_casched,     // 切换到调度器
+-    .prio_changed       = prio_changed_yat_casched,    // 优先级变更
+-    .update_curr        = update_curr_yat_casched,     // 更新当前任务
+-};
+-\end{code}
+-\end{tcolorbox}
+-
+-\subsection{核心分配策略实现}
+-
+-实现的核心分配机制包括：
+-
+-\begin{tcolorbox}[
+-    colback=green!5!white,
+-    colframe=green!50!black,
+-    title=\textbf{CPU亲和性优化实现},
+-    fonttitle=\bfseries,
+-    arc=3pt
+-]
+-\textbf{1. CPU亲和性优化}
+-\begin{code}
+-int select_task_rq_yat_casched(struct task_struct *p,
+-                               int task_cpu, int flags) {
+-    // 核心策略：优先选择任务上次运行的CPU
+-    if (p->yat_casched.last_cpu >= 0 && 
+-        cpu_online(p->yat_casched.last_cpu)) {
+-        return p->yat_casched.last_cpu;  // 优先选择上次CPU
+-    }
+-    return task_cpu;  // 回退到默认CPU分配
+-}
+-\end{code}
+-\end{tcolorbox}
+-
+-\begin{tcolorbox}[
+-    colback=orange!5!white,
+-    colframe=orange!50!black,
+-    title=\textbf{任务切换处理实现},
+-    fonttitle=\bfseries,
+-    arc=3pt
+-]
+-\textbf{2. 任务切换处理}
+-\begin{code}
+-void put_prev_task_yat_casched(struct rq *rq,
+-                               struct task_struct *p) {
+-    // 关键操作：记录任务上次运行的CPU编号
+-    // 为下次调度提供缓存感知依据
+-    p->yat_casched.last_cpu = rq->cpu;
+-}
+-\end{code}
+-\end{tcolorbox}
+-
+-% 图片预留位置：CPU亲和性调度过程图
+ \begin{figure}[htbp]
+ \centering
+-% \includegraphics[width=0.9\textwidth]{img/cpu_affinity_process.png}
+-\begin{tcolorbox}[
+-    colback=gray!10,
+-    colframe=gray!50,
+-    width=0.9\textwidth,
+-    center,
+-    arc=3pt
+-]
+-\centering
+-\textbf{[图片预留位置]}\\
+-\textbf{CPU亲和性调度过程示意图}\\
+-\footnotesize{展示任务在多核间的调度决策过程和缓存感知优化}
+-\end{tcolorbox}
+-\caption{CPU亲和性调度过程}
+-\label{fig:cpu_affinity}
++\begin{tikzpicture}[node distance=1.1cm,every node/.style={draw,rounded corners,align=center,font=\small}]
++\node (wake) {任务唤醒};
++\node (select) [below of=wake] {调度核心检查亲和性并进入选核回调};
++\node (model) [below of=select] {读取历史与预测收益，选择合法核心};
++\node (run) [below of=model] {入队、执行与历史更新};
++\draw[->] (wake)--(select);
++\draw[->] (select)--(model);
++\draw[->] (model)--(run);
++\end{tikzpicture}
++\caption{缓存感知选核的概念链路；回退与并发细节以源码为准}
+ \end{figure}
+ 
+-\subsection{系统集成与配置}
+-
+-\subsubsection{内核配置选项}
+-
+-在内核配置系统中添加了专门的配置选项：
+-
+-\begin{code}
+-# kernel/sched/Kconfig
+-config SCHED_CLASS_YAT_CASCHED
+-    bool "Yat_Casched scheduling class"
+-    default y
+-    help
+-      启用Yat_Casched调度类。该调度器通过优先保持任务在
+-      上次使用的CPU上运行来提供CPU亲和性优化。
+-\end{code}
+-
+-\subsubsection{编译系统集成}
+-
+-通过修改内核Makefile实现模块化编译：
+-
+-\begin{code}
+-# kernel/sched/Makefile
+-obj-$(CONFIG_SCHED_CLASS_YAT_CASCHED) += yat_casched.o
+-\end{code}
+-
+-\subsubsection{用户态接口}
+-
+-为用户程序提供了标准的调度策略设置接口：
+-
+-\begin{code}
+-// 设置进程使用Yat-CASched调度策略
+-struct sched_param param;
+-param.sched_priority = 0;  // 非实时调度器，优先级为0
+-
+-int ret = sched_setscheduler(pid, SCHED_YAT_CASCHED, &param);
+-if (ret == 0) {
+-    printf("Successfully set Yat_Casched policy\n");
+-}
+-\end{code}
+-
+-\subsection{功能验证与基础测试}
+-
+-\subsubsection{测试程序设计}
+-
+-我们开发了综合测试程序\texttt{test\_yat\_casched.c}来验证调度器的功能：
+-
+-\begin{itemize}
+-    \item \textbf{调度策略切换测试}：验证进程/线程能否成功切换到Yat-CASched策略
+-    \item \textbf{多线程CPU亲和性测试}：监控线程在不同CPU之间的切换情况
+-    \item \textbf{调度行为验证}：记录CPU切换次数，验证缓存局部性优化效果
+-\end{itemize}
+-
+-\subsubsection{内核编译与集成}
+-
+-实现了完整的内核集成流程：
+-
+-\textbf{1. 内核配置}
+-\begin{code}
+-# 启用Yat-CASched调度器
+-make menuconfig
+-# 选择：Processor type and features -> 
+-#       Yat_Casched scheduling class
+-\end{code}
+-
+-\textbf{2. 编译验证}
+-\begin{code}
+-# 编译内核
+-make -j$(nproc)
+-
+-# 验证调度器集成
+-nm vmlinux | grep yat_casched
+-\end{code}
+-
+-\textbf{3. 测试环境部署}
+-\begin{code}
+-# 创建测试initramfs
+-./create_simple_initramfs.sh
+-
+-# 启动QEMU测试环境
+-qemu-system-x86_64 -kernel arch/x86/boot/bzImage \
+-    -initrd initramfs.cpio.gz -m 2048 -smp 4 \
+-    -append "console=ttyS0 init=/init"
+-\end{code}
+-
+-\subsubsection{基础功能验证结果}
+-
+-通过在QEMU虚拟环境中的测试，验证了以下关键功能：
+-
+-\textbf{1. 调度策略注册成功}
+-\begin{itemize}
+-    \item 系统成功识别\texttt{SCHED\_YAT\_CASCHED = 8}调度策略
+-    \item 用户程序能够通过\texttt{sched\_setscheduler()}切换到新调度策略
+-    \item 调度器在\texttt{/proc/sched\_debug}中正确显示
+-\end{itemize}
+-
+-\textbf{2. CPU亲和性优化效果}
+-\begin{itemize}
+-    \item 任务倾向于在同一CPU上连续执行
+-    \item 相比\texttt{SCHED\_OTHER}，CPU切换频率显著降低
+-    \item 多线程环境下保持良好的负载均衡
+-\end{itemize}
+-
+-\textbf{3. 系统稳定性验证}
+-\begin{itemize}
+-    \item 调度器在多核环境下稳定运行
+-    \item 与其他调度策略兼容，无冲突
+-    \item 内核模块可正常加载和卸载
+-\end{itemize}
+-
+-\begin{tcolorbox}[
+-    colback=blue!10!white,
+-    colframe=blue!75!black,
+-    title=\textbf{本章技术贡献总结},
+-    fonttitle=\bfseries,
+-    arc=3pt
+-]
+-\begin{itemize}
+-    \item \textbf{系统集成}：成功将算法集成到Linux内核，实现了\texttt{SCHED\_YAT\_CASCHED}调度类
+-    \item \textbf{数据结构设计}：定义了简洁高效的调度实体和运行队列结构
+-    \item \textbf{接口实现}：完成了Linux调度框架要求的所有核心接口函数
+-    \item \textbf{配置系统}：建立了完整的内核配置、编译和部署流程
+-    \item \textbf{基础验证}：验证了调度器的基本功能和系统稳定性
+-\end{itemize}
+-\end{tcolorbox}
+-
+-\begin{tcolorbox}[
+-    colback=green!5!white,
+-    colframe=green!50!black,
+-    title=\textbf{面向第六章的测试准备},
+-    fonttitle=\bfseries,
+-    arc=3pt
+-]
+-本章的内核实现为第六章的详细性能测试奠定了坚实基础：
+-\begin{itemize}
+-    \item \textbf{实验环境}：QEMU/KVM虚拟化平台已就绪
+-    \item \textbf{测试工具}：内核模块和用户态测试程序开发完成
+-    \item \textbf{监控机制}：调度器状态监控和数据收集框架已建立
+-    \item \textbf{对比基准}：与传统CFS调度器的对比测试环境已配置
+-\end{itemize}
+-第六章将展示详细的性能测试结果和可视化分析，量化验证缓存感知调度的实际效果。
+-\end{tcolorbox}
++\subsection{工程验证层次}
++\begin{enumerate}
++\item 静态门禁检查声明、命名、补丁与文档链接。
++\item 目标文件构建检查当前配置下的类型与编译兼容性。
++\item QEMU 检查镜像启动、策略切换、任务完成和计数器变化。
++\item 真实平台重复实验评价性能与尾部延迟。
++\end{enumerate}
++上述层次不能相互替代，尤其不能将编译成功解释为调度正确性证明。既有镜像启动测试必须记录镜像哈希；若没有从当前提交重建镜像，不得将其归因于当前源码。
++
++\subsection{复现入口与验收条件}
++\begin{verbatim}
++make verify-all
++make kernel-obj
++linux-6.8-main/yat_test_scripts/compare_cfs_vs_yat.sh \
++  --tasks 8 --iters 2000000 --affinity none \
++  --sleep-us 200 --timeout 90
++\end{verbatim}
++验收检查两种策略是否完成相同工作量、在线 CPU 数是否符合预期、是否发生超时，以及串口日志中的错误。计数器应结合具体调用路径解读；性能指标应使用重复样本并报告离散程度。当前验证结果与其局限见实验章及仓库验证记录。
+\ No newline at end of file
+diff --git a/report/paper/chapter6-test.tex b/report/paper/chapter6-test.tex
+index 19c98ddb6..2bb6d40b7 100644
+--- a/report/paper/chapter6-test.tex
++++ b/report/paper/chapter6-test.tex
+@@ -1,75 +1,35 @@
+-% 第六章：内核测试与可视化
+-% 负责人：龙宇海
++% 实验结论必须与原始数据及版本对应。
++\section{实验设计、证据边界与复现方法}\label{sec:test}
+ 
+-\section{内核测试与可视化} \label{sec:test}
++\subsection{研究问题与证据层次}
++本文分别考察缓存感知分配在统一仿真模型下的效果，以及内核调度路径是否实际执行。仿真收益、内核功能正确性与真实机器性能是三个不同问题，不可相互替代。当前实验入口比较 WFD 与 CacheAware\_v2；尚不能据此给出 Global-EDF、Partitioned-EDF 或 Work-Stealing 的性能排名。
+ 
+-\subsection{测试环境}
++\subsection{仿真实验协议}
++以同一随机种子生成相同任务集合，在一致的缓存模型与处理器数量下比较两种分配策略。应保存源码提交号、工作区差异、JDK 版本、完整命令、配置文件、随机种子、CSV 及其元数据。快速回放只检查执行链路；正式结论需要多个独立种子，并保留每个种子的成对结果。
++\begin{verbatim}
++make -C simulator test
++make -C simulator verify
++make -C simulator run-quick
++\end{verbatim}
++历史 README 中的单种子百分比属于历史记录，不能在未核对模型版本及原始数据前视为本版复现实验结果。模型输出的缓存命中率不是硬件性能计数器测量值，模拟时间也不能直接解释为真实墙钟时间。
+ 
+-\subsubsection{硬件环境}
+-\begin{itemize}
+-    \item 处理器：Intel Xeon Gold 6248R (24核心，48线程)
+-    \item 内存：64GB DDR4-2933
+-    \item 缓存：L1 32KB(数据) + 32KB(指令)，L2 1MB，L3 35.75MB
+-    \item 操作系统：Ubuntu 20.04 LTS
+-\end{itemize}
++\subsection{指标定义与统计口径}
++设任务释放、开始和完成时间分别为 $r_i,s_i,f_i$，处理器数量为 $m$。当前分析器以时间零点为观察起点，报告最大完成时间 $M=\max_i f_i$、平均响应时间 $\sum_i(f_i-r_i)/n$ 和忙碌占比 $\sum_i(f_i-s_i)/(mM)$。这些定义适用于完整且有效的非重叠执行轨迹；若改用首个释放时刻作为观察起点，必须同步修改分母与文档。
+ 
+-\subsubsection{软件环境}
+-\begin{itemize}
+-    \item 编译器：GCC 9.4.0
+-    \item 性能分析工具：Intel VTune Profiler
+-    \item 基准测试：自研DAG任务生成器
+-\end{itemize}
++各核执行时间之和记为 $L_j$，其均值和总体标准差为 $\bar L$ 与 $\sigma_L$。当前负载均衡指标为 $\max(0,1-\sigma_L/\bar L)$；零负载返回零。截断保证指标位于约定区间，但会使严重失衡情形同为零，故建议同时报告各核负载。
+ 
+-\subsection{测试方法}
++当前任务实体没有独立的截止期字段，分析器采用代理截止期 $d_i=\max(0,r_i)+2C_i$，其中 $C_i$ 为预期执行时间；仅当 $f_i>d_i$ 时计为超期。该指标只描述此假设下的结果，不能证明硬实时可调度性。能耗字段也仅为简化模型估计，不应标注为焦耳实测。
+ 
+-\subsubsection{基准算法}
+-\begin{itemize}
+-    \item \textbf{Global-EDF}：全局最早截止时间优先
+-    \item \textbf{Partitioned-EDF}：分区最早截止时间优先
+-    \item \textbf{Work-Stealing}：工作窃取算法
+-    \item \textbf{Cache-Aware}：现有缓存感知调度算法
+-\end{itemize}
++对每个配对用例计算 $100(M_{\mathrm{WFD}}-M_{\mathrm{CA}})/M_{\mathrm{WFD}}$，基线为零的用例单独说明；缓存命中率差以百分点报告。正式报告应同时提供样本数、均值、中位数、离散程度与按独立种子计算的置信区间，并说明平局和失败用例的处理，避免只报告胜率或最佳结果。
+ 
+-\subsubsection{性能指标}
+-\begin{itemize}
+-    \item \textbf{平均响应时间}：任务从到达到完成的时间
+-    \item \textbf{截止时间违反率}：超过截止时间的任务比例
+-    \item \textbf{缓存命中率}：L1、L2、L3缓存的命中率
+-    \item \textbf{系统吞吐量}：单位时间完成的任务数
+-\end{itemize}
++\subsection{内核验证与当前观察}
++仓库 README 记录了 8 任务、4 核、200 万次迭代和 200 微秒唤醒间隔的历史实验：AJLR 决策计数器发生变化，但墙钟时间约为 CFS 的 1.9--2.2 倍。该记录支持调度路径已被触发，尚不支持性能优于 CFS。本次文档修订未重新运行内核实验，因此这些数值仅作为待复核的历史观察。
+ 
+-\subsection{测试结果}
++复核应记录内核提交、配置、启动参数、虚拟机或实机拓扑、CPU 亲和性、负载参数、超时与退出码，并保存每轮计数器前后差值。计数器增长证明路径执行，不能单独证明任务无丢失、无饥饿或调度器具有实时保证。性能比较应重复运行并交替基线顺序，报告墙钟分布及异常轮次；硬件缓存事件需另行采集和说明事件定义。
+ 
+-\subsubsection{性能对比}
+-\begin{table}[H]
+-\centering
+-\caption{各调度算法性能对比}
+-\begin{tabular}{|l|c|c|c|c|}
+-\hline
+-\textbf{算法} & \textbf{平均响应时间(ms)} & \textbf{截止时间违反率(\%)} & \textbf{L1缓存命中率(\%)} & \textbf{系统吞吐量} \\
+-\hline
+-Global-EDF & 45.2 & 12.3 & 78.5 & 1.0 \\
+-\hline
+-Partitioned-EDF & 42.1 & 10.8 & 82.1 & 1.08 \\
+-\hline
+-Work-Stealing & 38.7 & 9.2 & 84.3 & 1.15 \\
+-\hline
+-Cache-Aware & 35.4 & 7.6 & 87.2 & 1.25 \\
+-\hline
+-\textbf{Yat-CASched} & \textbf{28.9} & \textbf{4.1} & \textbf{91.7} & \textbf{1.42} \\
+-\hline
+-\end{tabular}
+-\end{table}
++\subsection{有效性威胁与未完成验证}
++模型参数、任务生成分布和单一种子均可能影响结论；仿真中的缓存状态不能完整描述共享缓存竞争、迁移与内核锁开销。QEMU 主要用于功能验证，其计时不能直接外推到真实多核平台。原稿中的硬件配置、EDF 对比表和吞吐量提升 42\% 缺少可追溯的实验记录，本版撤下这些确定性结论，待补齐原始数据、脚本和环境信息后再纳入结果章节。
++\subsection{本轮归档实验结果}
++2026年10月24日，在默认8核模型下对种子1至5分别执行100个用例，每例60任务。以种子内配对改善的均值作为独立观测，五种子 Makespan 改善均值为 $-0.954\%$，95\% Student-$t$ 区间为 $[-2.700\%,0.792\%]$（自由度4）。区间跨零，当前实验不能支持稳定的完成时间优势。缓存命中率差均值为0.374个百分点，区间为[0.041,0.708]个百分点；该结果来自模型输出，且CSV舍入会影响末位统计。
+ 
+-\subsubsection{可扩展性测试}
+-随着核心数量的增加，Yat-CASched相对于基准算法的性能优势更加明显，在24核心系统中性能提升达到42\%。
+-
+-\subsection{测试分析}
+-
+-测试结果表明，Yat-CASched在所有关键性能指标上都优于现有算法：
+-\begin{itemize}
+-    \item 平均响应时间降低36\%
+-    \item 截止时间违反率降低66\%
+-    \item L1缓存命中率提升17\%
+-    \item 系统吞吐量提升42\%
+-\end{itemize}
++本轮另使用既有内核镜像在QEMU中运行8任务、每任务200万迭代、4核、无固定亲和性及200微秒休眠的单次对比。两策略完成的工作量均为1600万，Yat与CFS累计墙钟之比约为2.666。此结果仅为已有镜像的功能冒烟及单次观测，不代表当前源码重建结果或真实性能分布。原始CSV、串口日志、镜像哈希、源码差异及统计脚本归档于仓库的\texttt{docs/validation/2026-10-24/}。
+diff --git a/report/paper/chapter7-difficulties.tex b/report/paper/chapter7-difficulties.tex
+index 52dcb49aa..864d5e6cb 100644
+--- a/report/paper/chapter7-difficulties.tex
++++ b/report/paper/chapter7-difficulties.tex
+@@ -8,7 +8,7 @@
+ \subsubsection{缓存行为建模复杂性}
+ \textbf{困难描述}：现代处理器的缓存行为受到多种因素影响，包括预取、替换策略、缓存一致性协议等，难以准确建模。
+ 
+-\textbf{解决方法}：
++\textbf{候选改进方向（需进一步验证）}：
+ \begin{itemize}
+     \item 采用基于机器学习的CRP模型，通过大量实验数据训练
+     \item 使用分段线性函数简化模型复杂度
+@@ -18,7 +18,7 @@
+ \subsubsection{实时性保证}
+ \textbf{困难描述}：缓存感知调度需要额外的计算开销，可能影响实时性保证。
+ 
+-\textbf{解决方法}：
++\textbf{候选改进方向（需进一步验证）}：
+ \begin{itemize}
+     \item 优化算法时间复杂度，使用高效的数据结构
+     \item 采用预计算和查表技术减少在线计算
+@@ -30,7 +30,7 @@
+ \subsubsection{多核同步}
+ \textbf{困难描述}：多核环境下的数据同步和状态一致性维护困难。
+ 
+-\textbf{解决方法}：
++\textbf{候选改进方向（需进一步验证）}：
+ \begin{itemize}
+     \item 采用无锁数据结构减少同步开销
+     \item 设计分布式状态管理机制
+@@ -40,9 +40,9 @@
+ \subsubsection{系统集成}
+ \textbf{困难描述}：调度器需要与操作系统内核紧密集成，涉及底层系统调用和硬件接口。
+ 
+-\textbf{解决方法}：
++\textbf{候选改进方向（需进一步验证）}：
+ \begin{itemize}
+-    \item 开发内核模块形式的调度器
++    \item 在内核源码中集成内置调度类
+     \item 设计标准化的接口层
+     \item 提供用户态测试框架便于调试
+ \end{itemize}
+diff --git a/report/paper/cover.tex b/report/paper/cover.tex
+index 943d0bddc..258dda6fd 100644
+--- a/report/paper/cover.tex
++++ b/report/paper/cover.tex
+@@ -12,7 +12,7 @@
+     {\Large \kaishu \projname \par}
+     \vspace{3em}
+ 
+-    {\fontsize{40pt}{42pt}\kaishu \selectfont \boldmath \reporttitle\par}
++    {\fontsize{30pt}{38pt}\kaishu \selectfont \boldmath \reporttitle\par}
+     \vspace*{\fill}
+ 
+     \begin{center}
+diff --git a/report/paper/navigation.tex b/report/paper/navigation.tex
+index 35ef1a28f..21d28c6ce 100644
+--- a/report/paper/navigation.tex
++++ b/report/paper/navigation.tex
+@@ -8,7 +8,7 @@
+     \item \hyperref[sec:design]{第3节：整体框架}
+     \item \hyperref[sec:theory]{第4节：理论/算法/Java模拟器}
+     \item \hyperref[sec:kernel]{第5节：内核实现}
+-    \item \hyperref[sec:test]{第6节：内核测试与可视化}
++    \item \hyperref[sec:test]{第6节：实验设计、证据边界与复现方法}
+     \item \hyperref[sec:difficulties]{第7节：遇到的困难和解决方法}
+     \item \hyperref[sec:refs]{参考资料}
+ \end{itemize}
+diff --git a/simulator/AlgorithmComparisonExperiment.java b/simulator/AlgorithmComparisonExperiment.java
+index bf0fb595b..16273b09f 100644
+--- a/simulator/AlgorithmComparisonExperiment.java
++++ b/simulator/AlgorithmComparisonExperiment.java
+@@ -560,6 +560,16 @@ public class AlgorithmComparisonExperiment {
+         generateReport(algorithmResults, cacheAwareWins, wfdWins, completedTests,
+                       totalMakespanImprovement, totalCacheHitImprovement);
+         
++        // Numeric artifacts are required even when rendering is disabled.
++        if (!withViz || !ENABLE_VIZ) {
++            File resultDir = new File("result");
++            if (!resultDir.isDirectory() && !resultDir.mkdirs()) {
++                throw new IllegalStateException("Cannot create result directory");
++            }
++            String csv = withViz ? "result/algorithm_comparison_results.csv"
++                    : "result/algorithm_comparison_seed_" + seed + ".csv";
++            visualizer.exportToCSV(algorithmResults, csv);
++        }
+         // 生成可视化图表（快速/CI 场景可用 --no-viz 跳过）
+         if (withViz && ENABLE_VIZ) {
+             generateVisualization(algorithmResults);
+diff --git a/simulator/Makefile b/simulator/Makefile
+index a89ee5a60..a058a29ea 100644
+--- a/simulator/Makefile
++++ b/simulator/Makefile
+@@ -107,6 +107,7 @@ lib-test: compile
+ # ---------- 单元测试（确定性核心逻辑） ----------
+ test: compile
+ 	@$(JR) -cp $(CP) $(TEST_CLASS)
++	@python3 ../scripts/check_simulator_export.py
+ 
+ # ---------- 主实验（完整规模） ----------
+ run: compile
+diff --git a/simulator/analyzer/PerformanceAnalyzer.java b/simulator/analyzer/PerformanceAnalyzer.java
+index a0ae6b5ed..ff394b0c8 100644
+--- a/simulator/analyzer/PerformanceAnalyzer.java
++++ b/simulator/analyzer/PerformanceAnalyzer.java
+@@ -262,7 +262,7 @@ public class PerformanceAnalyzer {
+         double stdDev = Math.sqrt(variance / processorCount);
+         
+         // 返回负载均衡度（1 - 归一化标准差）
+-        return avgLoad > 0 ? 1.0 - (stdDev / avgLoad) : 0;
++        return avgLoad > 0 ? Math.max(0.0, 1.0 - (stdDev / avgLoad)) : 0;
+     }
+     /**
+      * 计算缓存命中率（公平基线 C1）。
+@@ -469,7 +469,7 @@ public class PerformanceAnalyzer {
+         
+         for (Node task : tasks) {
+             // 简化假设：截止期等于执行时间的2倍
+-            long deadline = task.expectedET * 2;
++            double deadline = Math.max(0L, task.release) + 2.0 * task.expectedET;
+             if (task.finishAt > deadline) {
+                 missedCount++;
+             }
+diff --git a/simulator/tests/YatSimulatorTest.java b/simulator/tests/YatSimulatorTest.java
+index 80f2ed82f..a0037ee10 100644
+--- a/simulator/tests/YatSimulatorTest.java
++++ b/simulator/tests/YatSimulatorTest.java
+@@ -636,11 +636,31 @@ public class YatSimulatorTest {
+         }
+     }
+ 
++    private static void testMetricBoundaries() {
++        Node n = new Node(0, Node.NodeType.SOLO, 1, 1,
++                new RecencyProfileReal(100), new Random(1));
++        n.partition = 0;
++        n.expectedET = 100;
++        n.release = 1000;
++        n.start = 1000;
++        n.finishAt = 1200;
++        PerformanceAnalyzer a = new PerformanceAnalyzer();
++        PerformanceAnalyzer.ExperimentResult r = a.analyzeAlgorithmPerformance("WFD", 0, List.of(n), 4);
++        checkNear("concentrated load stays in [0,1]", 0.0, r.loadBalance, 1e-12);
++        checkEq("relative deadline includes release; equality is on time", 0, r.missedDeadlines);
++        n.finishAt = 1201;
++        checkEq("one unit late misses deadline", 1,
++                a.analyzeAlgorithmPerformance("WFD", 1, List.of(n), 4).missedDeadlines);
++        n.expectedET = Long.MAX_VALUE;
++        checkEq("deadline multiplication does not overflow", 0,
++                a.analyzeAlgorithmPerformance("WFD", 2, List.of(n), 4).missedDeadlines);
++    }
+     public static void main(String[] args) {
+         System.out.println("==========================================");
+         System.out.println(" Yat-CAShed 模拟器单元测试");
+         System.out.println("==========================================");
+ 
++        testMetricBoundaries();
+         testNode();
+         testRecencyProfile();
+         testCRPBoundaries();

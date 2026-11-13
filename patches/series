@@ -4,3 +4,4 @@
 0004-kernel-gitignore.patch
 0005-test-env.patch
 0006-docs.patch
+0007-sched-yat-casched-fix-lockdep-inversion.patch

@@ -4,7 +4,7 @@ Upstream: linux v6.8 (torvalds)
 
 --- /dev/null
 +++ b/boot_test_scripts/README.md
-@@ -0,0 +1,102 @@
+@@ -0,0 +1,137 @@
 +# Yat-CAShed 用户态测试程序（只放 C 源码）
 +
 +## 目录约定（重要）
@@ -43,25 +43,56 @@ Upstream: linux v6.8 (torvalds)
 +打印每个进程的 PID、`sched_getcpu()` 结果与策略设置返回值。用途是**功能性验证**：
 +调度类是否注册、`sched_setattr` 是否被接受、任务是否真的被调度到 CPU 上。
 +
-+### `yat_bench.c` —— 快不快
++### `yat_bench.c` —— 快不快，以及 AJLR 有没有生效
 +
-+同一份固定工作量（LCG + 异或混合，避免被编译器优化掉），在指定 CPU 上跑 `iters` 次，
-+N 个子进程并行，父进程通过 pipe 收回每个子进程的墙钟时间，聚合成一行 CSV：
++同一份固定工作量（LCG + 异或混合，避免被编译器优化掉），N 个子进程并行跑 `iters` 次，
++父进程通过 pipe 收回每个子进程的墙钟时间，聚合成一行 CSV。
++
++#### 命令行参数
++
++| 参数 | 默认 | 说明 |
++|------|------|------|
++| `--policy cfs\\|yat` | `cfs` | 目标策略（由内核命令行 `yatbench=` 传入，保证同一二进制） |
++| `--tasks N` | 4 | 并发子进程数（上限 `MAX_TASKS`） |
++| `--iters M` | 20000000 | 每个子进程的固定迭代次数 |
++| `--cpu C` | 0 | `--affinity shared` 时 pin 到哪个物理 CPU |
++| `--affinity shared\\|none\\|spread` | `shared` | 亲和性模式，见下表 |
++| `--sleep-us U` | 0 | 每段计算后 `nanosleep` U 微秒，制造真实唤醒；计算固定切 64 段 |
++| `--verbose` | 关 | 逐阶段打印 `YTASK` 标记，仅用于 guest 挂死时定位 |
++
++亲和性模式的区别（**这条直接决定能不能测到 AJLR**）：
++
++| 模式 | 行为 | `nr_cpus_allowed` | 能测什么 |
++|------|------|-------------------|----------|
++| `shared` | 全部 pin 到 `--cpu` | 1 | 同核竞争下的时间片分配；**测不到 AJLR**（`core.c` 的包装层直接 `cpumask_any()` 返回，不调用调度类） |
++| `none` | 不设亲和性 | 在线 CPU 数 | 跨核放置；A8 验证**必须**用这个 |
++| `spread` | 第 i 个任务 pin 到 CPU `i % 在线数` | 1 | 强制初始分散，观察是否会被重新收敛 |
++
++> 另外 `--sleep-us 0` 时任务从不阻塞，只有 `WF_FORK`，而
++> `select_task_rq_yat_casched()` 刻意在非 `WF_TTWU` 早退 —— 所以
++> **验证 AJLR 必须同时满足 `--affinity none` 与 `--sleep-us > 0`**。
++> 早期版本把任务固定 pin 到单核且从不阻塞，两个条件同时不成立，
++> 这正是历史上「`jobs_placed` 恒 0」的直接原因（详见仓库
++> [`docs/ROADMAP.md`](../../docs/ROADMAP.md) §A8.1）。
++
++#### 输出
 +
 +```
-+YATCSV,policy,tasks,iters,cpu,sum_wall_ns,min_wall_ns,max_wall_ns,sum_work_units,vol_ctx,invol_ctx,cpus_online
++YATCSV,policy,tasks,iters,cpu,sum_wall_ns,min_wall_ns,max_wall_ns,sum_work_units,
++       vol_ctx,invol_ctx,cpus_online,affinity,sleep_us
 +```
 +
-+字段含义：
++（实际是一行，这里为可读性折行；共 **13 列**。）
 +
 +| 字段 | 说明 |
 +|------|------|
 +| `policy` | `cfs` 或 `yat`（由内核命令行 `yatbench=` 传入） |
-+| `sum_wall_ns` | N 个子进程墙钟时间之和（ns） |
++| `sum_wall_ns` | N 个子进程墙钟时间之和（ns），**主指标** |
 +| `min/max_wall_ns` | 单个子进程的最快 / 最慢墙钟时间（反映离散度） |
 +| `sum_work_units` | 校验和：应为 `tasks × iters`，用于确认真的跑完了 |
 +| `vol_ctx` / `invol_ctx` | 自愿 / 非自愿上下文切换次数（读 `/proc/self/status`） |
 +| `cpus_online` | guest 内 `_SC_NPROCESSORS_ONLN`；**必须 > 1**，否则对比无意义 |
++| `affinity` / `sleep_us` | A8 阶段追加的自描述列（加在行尾，旧列位置不变），用于事后判断这组数据能否评价 AJLR |
 +
 +退出码：`0` 成功；`2` 参数或调用失败；`3` 当前内核没有 `SCHED_YAT_CASCHED`。
 +
@@ -82,6 +113,10 @@ Upstream: linux v6.8 (torvalds)
 +
 +# 性能对比：自动跑 CFS 与 YAT 两轮 QEMU，产出 CSV
 +./compare_cfs_vs_yat.sh --iters 2000000
++
++# 验证 AJLR（A8）：必须可跨核 + 有唤醒
++./compare_cfs_vs_yat.sh --tasks 8 --iters 2000000 \\
++                        --affinity none --sleep-us 200 --timeout 300
 +
 +# 或者从仓库根目录用 Makefile
 +make kernel-compare
@@ -3186,3 +3221,57 @@ Upstream: linux v6.8 (torvalds)
 +## Conclusion
 +Yat-CAShed shows clear advantages in reducing CPU migrations and improving performance.
 \ No newline at end of file
+--- /dev/null
++++ b/boot_test_scripts/yat_affinity_test.c
+@@ -0,0 +1,51 @@
++#define _GNU_SOURCE
++#include <sched.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <unistd.h>
++#include <time.h>
++#include <errno.h>
++
++/* Four-vCPU guest required. Inspect AJLR intent, not only core fallback. */
++static int phase(int first)
++{
++    cpu_set_t mask;
++    CPU_ZERO(&mask); CPU_SET(first, &mask); CPU_SET(first + 1, &mask);
++    if (sched_setaffinity(0, sizeof(mask), &mask)) { perror("affinity"); return 1; }
++    cpu_set_t effective;
++    CPU_ZERO(&effective);
++    if (sched_getaffinity(0, sizeof(effective), &effective)) { perror("getaffinity"); return 6; }
++    if (!CPU_EQUAL(&effective, &mask)) {
++        printf("MASK-MISMATCH requested=%d,%d count=%d\n", first, first+1, CPU_COUNT(&effective));
++        return 7;
++    }
++    for (int i = 0; i < 100; i++) {
++        struct timespec pause = {0, 2000000};
++        if (nanosleep(&pause, NULL)) { perror("nanosleep"); return 1; }
++        int actual = sched_getcpu();
++        if (actual != first && actual != first + 1) { printf("RUN-MISMATCH actual=%d mask=%d,%d\n", actual, first, first+1); return 2; }
++    }
++    FILE *f = fopen("/sys/kernel/debug/yat_casched/placements", "r");
++    if (!f) { perror("placements"); return 3; }
++    char line[256]; int found = 0, bad = 0;
++    while (fgets(line, sizeof(line), f)) {
++        int job, pid, prio, assigned, actual;
++        if (sscanf(line, "%d%d%d%d%d", &job, &pid, &prio, &assigned, &actual) == 5 && pid == getpid()) {
++            found = 1;
++            printf("PHASE mask=%d,%d assigned=%d actual=%d\n", first, first+1, assigned, actual);
++            bad = assigned != first && assigned != first + 1;
++        }
++    }
++    fclose(f);
++    return !found ? 4 : bad ? 5 : 0;
++}
++int main(void)
++{
++    struct sched_param param = {0};
++    if (sched_setscheduler(0, 8, &param)) { perror("SCHED_YAT_CASCHED"); return 1; }
++    int rc = phase(0);
++    if (!rc) rc = phase(2);
++    if (!rc) rc = phase(0);
++    printf("YAT-AFFINITY %s rc=%d\n", rc ? "FAIL" : "PASS", rc);
++    return rc;
++}

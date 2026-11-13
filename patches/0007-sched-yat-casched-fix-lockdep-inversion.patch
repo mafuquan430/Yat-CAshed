@@ -1,0 +1,57 @@
+From: Yat-CAShed <noreply@example.com>
+Subject: [PATCH] sched/yat_casched: fix lockdep irq inversion in task_dead
+Upstream: linux v6.8 (torvalds)
+
+task_dead_yat_casched() 在开中断上下文里销毁作业，而 yat_destroy_job() 要取
+pool->lock / dag->lock —— 这两把锁在 balance 路径里总是"持 rq_lock 且关中断"获取，
+因此是 HARDIRQ-safe 锁。lockdep 会报出真实的 ABBA：
+
+  CPU0: lock(pool->lock)                      // 中断开
+  CPU1: lock(rq->lock, 中断关) -> lock(pool->lock)
+  <CPU0 中断> lock(rq->lock)                  // 环闭合
+
+镜像 #18 的串口日志可复现（见 docs/validation/2026-10-30/final/serial.log 与
+docs/validation/2026-11-13/）。用 local_irq_save() 把整段销毁放进关中断区间后，
+pool->lock/dag->lock 的获取上下文与其它路径一致，环被打断；临界区内只有 list 操作
+与 kfree，不会睡眠。
+
+修复后镜像 #19 复跑两组对照，串口日志中同类告警计数为 0。
+
+--- a/kernel/sched/yat_casched.c	2026-11-13 13:14:27.363550860 +0800
++++ b/kernel/sched/yat_casched.c	2026-11-13 13:14:27.363550860 +0800
+@@ -2191,12 +2191,35 @@
+ static void task_dead_yat_casched(struct task_struct *p)
+ {
+     struct yat_job *job = READ_ONCE(p->yat_casched.job);
++    unsigned long flags;
+ 
+     if (!job)
+         return;
+ 
+     WRITE_ONCE(p->yat_casched.job, NULL);
++
++    /*
++     * 关中断后再销毁。
++     *
++     * 这里不是"多此一举"：yat_destroy_job() 要取 pool->lock 与 dag->lock，
++     * 而这两把锁在 balance 路径里总是**关中断**获取的
++     * （balance_yat_casched -> rq_lock(关中断) -> ... -> pool->lock），
++     * 于是它们在 lockdep 眼里是 HARDIRQ-safe 锁。
++     * 若在 task_dead（finish_task_switch 调用，中断是开的）里直接取，
++     * lockdep 会报出真实的 ABBA：
++     *
++     *   CPU0: lock(pool->lock)                      // 中断开
++     *   CPU1: lock(rq->lock, 中断关) -> lock(pool->lock)
++     *   <CPU0 中断> lock(rq->lock)                  // 环闭合
++     *
++     * 实测该告警在 QEMU 串口里可复现（见 docs/validation/，镜像 #18）。
++     * 用 local_irq_save() 把整段销毁放进关中断区间后，pool->lock/dag->lock
++     * 的获取上下文与其它路径一致，环被打断；临界区内只有 list 操作和
++     * kfree，不会睡眠，时延是常数级。
++     */
++    local_irq_save(flags);
+     yat_destroy_job(job);
++    local_irq_restore(flags);
+ }
+ 
+ /*

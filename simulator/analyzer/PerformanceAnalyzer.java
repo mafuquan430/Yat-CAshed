@@ -262,7 +262,7 @@ public class PerformanceAnalyzer {
         double stdDev = Math.sqrt(variance / processorCount);
         
         // 返回负载均衡度（1 - 归一化标准差）
-        return avgLoad > 0 ? 1.0 - (stdDev / avgLoad) : 0;
+        return avgLoad > 0 ? Math.max(0.0, 1.0 - (stdDev / avgLoad)) : 0;
     }
     /**
      * 计算缓存命中率（公平基线 C1）。
@@ -469,7 +469,7 @@ public class PerformanceAnalyzer {
         
         for (Node task : tasks) {
             // 简化假设：截止期等于执行时间的2倍
-            long deadline = task.expectedET * 2;
+            double deadline = Math.max(0L, task.release) + 2.0 * task.expectedET;
             if (task.finishAt > deadline) {
                 missedCount++;
             }

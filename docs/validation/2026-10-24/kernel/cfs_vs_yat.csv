@@ -1,0 +1,3 @@
+policy,tasks,iters,cpu,sum_wall_ns,min_wall_ns,max_wall_ns,sum_work_units,vol_ctx,invol_ctx,cpus_online,affinity,sleep_us
+cfs,8,2000000,0,1611953620,144928290,241891810,16000000,478,123,4,none,200
+yat,8,2000000,0,4297420550,456147820,758233260,16000000,461,100,4,none,200

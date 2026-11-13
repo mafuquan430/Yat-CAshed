@@ -107,6 +107,7 @@ lib-test: compile
 # ---------- 单元测试（确定性核心逻辑） ----------
 test: compile
 	@$(JR) -cp $(CP) $(TEST_CLASS)
+	@python3 ../scripts/check_simulator_export.py
 
 # ---------- 主实验（完整规模） ----------
 run: compile

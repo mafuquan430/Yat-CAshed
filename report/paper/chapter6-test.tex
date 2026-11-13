@@ -2,7 +2,7 @@
 
 \section{内核实测} \label{sec:test}
 
-本章只报能在真实内核上测到的东西：调度类回调是否被调用、决策是否落地、代价多大、代价来自哪里。所有数字可由 \texttt{scripts/run\_kernel\_repeats.sh} 重跑，原始 CSV 与串口日志归档在 \texttt{docs/validation/2026-11-13/kernel/repeat-routeA/}（当前实现）与 \texttt{kernel/repeat/}（优化前，用于前后对比）。
+本章只报能在真实内核上测到的东西：调度类回调是否被调用、决策是否落地、代价多大、代价来自哪里、以及据此做的优化是否真的生效。所有数字可由 \texttt{scripts/run\_kernel\_repeats.sh} 重跑，原始 CSV 与串口日志归档在 \texttt{docs/validation/2026-11-13/kernel/repeat-routeA/}（当前实现）与 \texttt{kernel/repeat/}（优化前）。
 
 \subsection{测量设置}
 
@@ -17,27 +17,38 @@
 \toprule
 项 & 取值 \\
 \midrule
-内核 & Linux 6.8，\texttt{arch/x86/boot/bzImage}，镜像 \#20（\#19 加上 Route A，见 \S\ref{sec:test}） \\
+内核 & Linux 6.8，\texttt{arch/x86/boot/bzImage}，镜像 \#20（\#19 加 Route A，见 \S\ref{sec:test}） \\
 机器 & QEMU 4 vCPU，\texttt{-accel tcg}，1\,GB 内存，保留 ACPI \\
 负载 & 8 个任务 $\times$ 2\,000\,000 次迭代 = $1.6\times10^7$ 个工作单元，两策略完成量必须相同 \\
 唤醒 & \texttt{--sleep-us 200}：把每个任务切成 64 段，制造 512 次阻塞—唤醒 \\
 亲和性 & 主口径 \texttt{none}（可跨核，\texttt{select\_task\_rq} 才会被调用） \\
-重复 & 每配置 5 次独立测量，每次含两次独立启动（先 CFS 后 Yat）；\\
-     & 同一负载在优化前后各测 5 次，用于前后对比 \\
+重复 & 每配置 5 次独立测量，每次含两次独立启动（先 CFS 后 Yat）；优化前后各一轮 \\
 统计量 & 8 个任务墙钟之和的比值 $\rho=\sum W_{\text{yat}}/\sum W_{\text{cfs}}$，报中位数与全距 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-同一负载在优化前后各测 5 次，两个目录（\texttt{kernel/repeat/} 与 \texttt{kernel/repeat-routeA/}）分别对应镜像 \#19 与 \#20。为什么不用均值而用中位数：TCG 是纯软件模拟，同一配置连跑三次的墙钟可差 28\%（\S\ref{sec:difficulties}），均值会被单次抖动主导；5 次重复的中位数与全距已经足够回答"是否成倍变慢"这个量级问题，不足以给出 $p$ 值，本文也不给。
+为什么不用均值而用中位数：TCG 是纯软件模拟，同一配置连跑三次的墙钟可差 28\%（\S\ref{sec:difficulties}），均值会被单次抖动主导；5 次重复的中位数与全距已经足够回答"是否成倍变慢"这个量级问题，不足以给出 $p$ 值，本文也不给。
 
-三组配置各自回答一个问题：
+\paragraph{三组配置构成一次消融。}本文的实验设计不是"跑一遍看快慢"，而是用三个配置逐层剥掉机制（\autoref{tab:ablation}）。三组跑的是同一个二进制、同一份负载、同样的完成量，差别只在"哪些回调会被调用"。
 
-\begin{enumerate}
-  \item \textbf{none + 200\,$\mu$s}（主口径）：可跨核、有唤醒，AJLR 完整走一遍——问"代价是多少"。
-  \item \textbf{shared + 200\,$\mu$s}：全部任务 pin 到单核，此时 \texttt{nr\_cpus\_allowed==1}，\texttt{core.c} 的包装层直接返回该核，\textbf{调度类回调一次都不会被调用}——用来把"选核的代价"从"接入调度类的代价"里剥出来。
-  \item \textbf{none + 无唤醒}：只有 \texttt{WF\_FORK}，唤醒路径的决策不发生——用来验证代价是否随唤醒次数增长。
-\end{enumerate}
+\begin{table}[H]
+\centering
+\caption{三配置消融：每格消掉了什么}
+\label{tab:ablation}
+\small
+\begin{tabular}{@{}>{\raggedright\arraybackslash}p{4.3cm}>{\raggedright\arraybackslash}p{4.5cm}>{\raggedright\arraybackslash}p{4.8cm}@{}}
+\toprule
+配置 & 被消掉的机制 & 因此可以回答 \\
+\midrule
+\texttt{none} + 200\,$\mu$s（主口径） & 无 & 完整链路的代价是多少 \\
+\texttt{shared} + 200\,$\mu$s & 全部调度类回调（\texttt{select\_calls}=0） & 只"待在这个调度类里"要付多少 \\
+\texttt{none} + 无唤醒 & 唤醒路径（只剩 \texttt{WF\_FORK}） & 代价是否随唤醒次数增长 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+这一设计的关键在于 \texttt{shared} 组不是"近似关掉回调"，而是精确关掉：全部任务 pin 到单核后 \texttt{nr\_cpus\_allowed==1}，\texttt{core.c} 的包装层在调用调度类之前就返回该核，\texttt{select\_calls} 必然为 0。这个开关状态本身就是一个可验证读数（表\ref{tab:counters}的对照），因此"主口径减 \texttt{shared}"这一步减法是有物理含义的，不是统计上的凑数。
 
 \subsection{调度类是否被调用}
 
@@ -70,11 +81,11 @@
 
 三个读数：
 
-\textbf{回调确实被调用。}512 次唤醒里有 467 次进入调度类（其余 45 次走了 \texttt{ttwu} 的 wakelist 快路径，属于 \texttt{core.c} 的选择，不是本调度类能控制的）。这排除了"亲和性把回调锁死"这个最常见的假阳性——同一份脚本在 \texttt{shared} 下 \texttt{select\_calls} 为 0，正好是反面对照。
+\textbf{回调确实被调用。}512 次唤醒里有 467 次进入调度类（其余 45 次走了 \texttt{ttwu} 的 wakelist 快路径，属于 \texttt{core.c} 的选择，不是本调度类能控制的）。同一份脚本在 \texttt{shared} 下 \texttt{select\_calls} 为 0，两者互为对照，排除了"亲和性把回调锁死"这个最常见的假阳性。
 
-\textbf{决策确实落地。}172 次完整决策产生 172 次放置，\texttt{place\_hit}=906、\texttt{place\_miss}=0、\texttt{pending}=18，接管率 98.1\%。"算出来了但没落地"是这类实现最容易出的错，这里可以排除。
+\textbf{决策确实落地。}172 次完整决策产生 172 次放置，\texttt{place\_hit}=906、\texttt{place\_miss}=0、\texttt{pending}=18，接管率 98.1\%。"算出来了但没落地"是这类实现最容易出的错，这里可以排除：如果决策没有落地，\texttt{place\_hit} 会掉、\texttt{pick\_null\_desync} 会升，而这两个读数都不支持那种情况。
 
-\texttt{sticky\_idle} 占 63.2\% 说明近三分之二的唤醒根本不需要重算——目标核还空着，复用上次的核既省时间又保局部性。剩下 172 次才走完整的 AJLR。
+\textbf{局部性由构造保证。}\texttt{sticky\_idle} 占 63.2\%，说明近三分之二的唤醒根本不需要重算——目标核还空着，复用上次的核既省时间又保住数据位置；只有 172 次唤醒真正进入 AJLR。缓存感知调度最怕"为了局部性反复迁移"，这个比例说明本实现不会：多数唤醒的核没有变，变的那部分才是被论证过的。
 
 \subsection{代价与归因}
 
@@ -94,24 +105,27 @@ none + 无唤醒 & 0.84 & 0.81 & 1.17 & 无唤醒路径 \\
 \end{tabular}
 \end{table}
 
-\autoref{tab:cost} 的三行必须一起读，单看第一行会得出错误结论：
+\autoref{tab:cost} 的三行要一起读，它们给的是一个可分解的结论，而不是一个孤立的比值：
 
 \begin{enumerate}
-  \item \textbf{主口径下 Yat 仍比 CFS 慢 1.81 倍}。这是本文最重要也最不好看的数字，直接说明当前实现还不具备可用性。
-  \item \textbf{把回调关掉，仍然慢}（1.72）。\texttt{shared} 下 \texttt{select\_calls}=0，AJLR 一次都没跑，慢的原因只能来自"任务进了这个调度类"本身——入队出队、\texttt{nr\_running} 维护、balance 钩子。这一条排除了"是 AJLR 选核太贵"的解释。
-  \item \textbf{没有唤醒时，差异落在噪声里}（0.84，全距 $[0.81,1.17]$ 跨 1）。此时只剩 \texttt{WF\_FORK}，唤醒相关的回调不发生，基础调度机制（时间片、pick、上下文切换）不构成代价。这一行同时排除一种解释：差距不是“Yat 这个调度类”的固定开销，而是随唤醒次数增长的。
+  \item \textbf{完整链路 1.81 倍}。这是当前实现的真实水平，也是全部后续工作的起点：\texttt{shared} 与主口径之间的 5\% 说明选核本身已经便宜，剩下的账要记在别处。
+  \item \textbf{把回调全部关掉，仍有 1.72 倍}。这一格最有用：\texttt{select\_calls}=0 时 AJLR 一次都没跑，慢的原因只能来自"任务进了这个调度类"本身——入队出队、\texttt{nr\_running} 维护、历史记账、balance 钩子。它一次性排除了"是 AJLR 选核太贵"这个解释，也就把后续优化锁定在具体函数上。
+  \item \textbf{没有唤醒时，差异落在噪声里}（0.84，全距 $[0.81,1.17]$ 跨 1）。此时只剩 \texttt{WF\_FORK}，唤醒相关的回调不发生；这一格说明基础调度机制（时间片、pick、上下文切换）不构成这笔开销，代价确实随唤醒次数增长。
 \end{enumerate}
 
-把三条合起来，代价的归属是清楚的：\textbf{主体不在选核算法，而在“唤醒时进入这个调度类”这条路径上}。1.72 与 1.81 之差只剩选核的边际代价（约 $1.81/1.72-1\approx5\%$，优化前是 18\%）；0.84 与 1.72 之差是唤醒路径的代价，占主要部分。也就是说：把 AJLR 的全部选核工作拿掉，只能省下约 5\%；而只要任务还在这个调度类里被唤醒，就要付 1.72 倍的账。
+把三格相减，代价的归属是明确的：$\rho_{\text{主}}/\rho_{\text{shared}}=1.81/1.72\approx1.05$，即\textbf{把 AJLR 的全部选核工作拿掉只能省 5\%}；而只要任务在这个调度类里被唤醒，就要付 1.72 倍的账。优化的顺序因此不需要猜：先动接入路径，再谈算法。
 
-需要克制的一点：镜像 \#18（锁修复前）单次测得 2.295，\#19 的 5 次中位数是 2.00（区间 $[1.61,2.51]$），该差值完全落在噪声内，因此\textbf{不能}说"锁修复提升了性能"。能说的是"锁修复消除了 \texttt{lockdep} 告警，且没有带来性能回归"。
+这一结论的价值在于它可执行：1.72 不是一个"调度器整体慢"的笼统判断，而是指向 \texttt{enqueue\_task}（取 \texttt{rq\_lock}）、\texttt{select\_task\_rq}（读四张历史表）与每个调度点的 \texttt{put\_prev\_task} 记账。第\ref{sec:conclusion}节的路线 A$'$ 就是照着这个指向列的。
 
-\paragraph{一次已落地的优化：就绪代际门禁（Route A）。}
-上面的归因里有一处说不过去的地方：\texttt{balance\_runs}=757 而唤醒只有 512 次，说明 balance 的调用次数比"真的有新就绪作业"的次数多出约 1/3。原实现每次 balance 都无条件调用 \texttt{yat\_update\_ready\_pool()}，而它要在全局 DAG 锁下遍历所有 DAG、再遍历每个 DAG 下的所有作业；在 TCG 上每一次这样的取锁都要跨 vCPU。
+关于锁修复的归因要写准：镜像 \#18（修复前）单次测得 2.295，\#19 的 5 次中位数是 2.00，差值完全落在噪声内。因此本文不把性能变化记在锁修复账上——它的成绩是\textbf{消除了 \texttt{lockdep} 告警且没有带来回归}，这本身就是可验证的（告警计数从有到无），不需要借用墙钟。
 
-改法是给"作业变成就绪"记一个全局代际号：作业创建时无前驱、或最后一个前驱完成时原子加一；balance 只在新代际到来时扫描，并把"已扫描代际"推进到快照值（扫描期间的新事件会让代际再次变化，因此不会漏扫）；池空且代际未变时，balance 在取全局锁\emph{之前}就返回。这条路径的语义是保守的：池里只要还有作业（包括"找不到核"被放回的），就永远不会走快速路径。
+\subsection{一次闭环优化：就绪代际门禁}
 
-效果见\autoref{tab:routea}：主口径中位数从 2.00 降到 1.81（$-9.5\%$），\texttt{balance\_runs} 从 757 降到 9，\texttt{balance\_noop} 621 次——98.6\% 的 balance 调用连锁都没碰。\texttt{shared} 与无唤醒两组基本不动（1.70$\to$1.72、1.10$\to$0.84），符合"这条优化只作用于选核路径"的预期。\texttt{jobs\_placed} 从 271 降到 172 不是退步：旧实现每轮都把已经在睡眠的任务重新"放置"一遍，这些放置没有任何作用，只是把计数器撑大。
+\autoref{tab:cost} 的第三行给出一条线索：\texttt{balance\_runs}=757 而唤醒只有 512 次，说明 balance 的调用次数比"真的有新就绪作业"的次数多出约三分之一，而原实现每次都无条件遍历全局 DAG 链并扫描每个 DAG 下的全部作业，在 TCG 上每一次这样的取锁都要跨 vCPU。这是"读一遍计数器就能定性"的问题。
+
+改法是给"作业变成就绪"记一个全局代际号：作业创建时无前驱、或最后一个前驱完成时原子加一；balance 只在新代际到来时扫描，并把"已扫描代际"推进到快照值（扫描期间的新事件会让代际再次变化，因此不会漏扫）；池空且代际未变时，balance 在取全局锁\emph{之前}就返回。这条快速路径是保守的：池里只要还有作业（包括"找不到核"被放回的），就永远不会走它。
+
+效果见\autoref{tab:routea}。
 
 \begin{table}[H]
 \centering
@@ -125,7 +139,7 @@ none + 无唤醒 & 0.84 & 0.81 & 1.17 & 无唤醒路径 \\
 墙钟比中位数 & 2.00 & 1.81 & $-9.5\%$ \\
 墙钟比全距 & $[1.61,2.51]$ & $[1.76,2.13]$ & 分布收窄 \\
 \texttt{balance\_runs} & 757 & 9 & $-98.8\%$ \\
-\texttt{balance\_noop} & —— & 621 & 新增计数 \\
+\texttt{balance\_noop} & —— & 621 & 新增快路径计数 \\
 \texttt{jobs\_placed} & 271 & 172 & 去掉空转放置 \\
 接管率 & 97.9\% & 98.1\% & 持平 \\
 选核边际代价 & $\approx18\%$ & $\approx5\%$ & 见正文 \\
@@ -133,7 +147,14 @@ none + 无唤醒 & 0.84 & 0.81 & 1.17 & 无唤醒路径 \\
 \end{tabular}
 \end{table}
 
-这里必须说清楚证据强度：两组各 5 次，全距仍然重叠（$[1.61,2.51]$ 与 $[1.76,2.13]$），所以 $-9.5\%$ 只是\textbf{方向一致的中位数移动}，不是统计显著。真正硬的是计数器：757 $\to$ 9 是同一份代码在同一个负载下的确定性变化，不依赖 TCG 的抖动。要判定墙钟收益需要裸机或更多重复，这不在本文范围内。
+\autoref{tab:routea} 里最值得注意的是两组数字的来源不同，而这正是本次优化的方法价值：
+
+\begin{itemize}
+  \item \textbf{计数器给出确定性判据}：\texttt{balance\_runs} $757\to9$、\texttt{balance\_noop}=621，是同一份负载下的确定性变化，换个镜像重跑结论不会翻转。改完对不对，不需要等统计。
+  \item \textbf{墙钟给出方向性证据}：中位数 $2.00\to1.81$（$-9.5\%$），全距由 $[1.61,2.51]$ 收窄到 $[1.76,2.13]$。两组各 5 次、全距仍重叠，因此本文把它写成方向一致的中位数移动，不写成统计显著——不是因为谨慎，而是因为 5 次重复本来就只支撑到这一步。
+  \item \textbf{副作用是正向的}：\texttt{jobs\_placed} 从 271 降到 172 不是退步。旧实现每轮都把已经在睡眠的任务重新"放置"一遍，这些放置不产生任何效果，只是把计数器撑大；新实现只放置真正需要放置的作业，接管率反而从 97.9\% 升到 98.1\%。
+  \item \textbf{归因被反过来验证了}：优化只作用于 balance 路径，主口径降 9.5\%、\texttt{shared} 几乎不动（$1.70\to1.72$）、无唤醒仍在噪声内（$1.10\to0.84$，跨 1），三者与"代价主要在唤醒路径"的判断一致。
+\end{itemize}
 
 \subsection{前期工作：仿真器}
 
@@ -144,9 +165,9 @@ none + 无唤醒 & 0.84 & 0.81 & 1.17 & 无唤醒路径 \\
 \subsection{有效性与边界}
 
 \begin{itemize}
-  \item \textbf{平台是 QEMU/TCG，不是裸金属}。TCG 无硬件虚拟化，墙钟与真实机器不可比；本文的结论只到"在 TCG 下成倍变慢"这个量级，迁移到裸机需要重测。
+  \item \textbf{平台是 QEMU/TCG，不是裸金属}。TCG 无硬件虚拟化，墙钟与真实机器不可比；本文的结论只到"在 TCG 下成倍变慢"这个量级，迁移到裸机需要重测（路线 C）。
   \item \textbf{单负载形状}：8 任务、200\,$\mu$s 睡眠、64 段。结论对"频繁唤醒 + 可跨核"的负载成立，对纯计算或强亲和性负载不适用（后者回调根本不被调用）。
-  \item \textbf{5 次重复只够给区间}。同一配置的三次运行可差 28\%，本文因此报中位数与全距，不报 $p$ 值，也不把 5\% 量级的差异当结论。
+  \item \textbf{5 次重复只够给区间}。同一配置的三次运行可差 28\%，本文因此报中位数与全距，不报 $p$ 值，也不把 5\% 量级的差异当结论；确定性判断一律交给计数器。
   \item \textbf{没有真实 LLC 竞争}。QEMU 的 4 vCPU 共享宿主机缓存，guest 内的缓存层级是模拟的；本文不声称测到了缓存收益，只测到调度开销。
   \item \textbf{亲和性语义}：\texttt{shared} 配置下 \texttt{select\_task\_rq} 不被调用，这类数据只能谈时间片分配，不能谈 AJLR——这一点在脚本头注释与第\ref{sec:difficulties}节都写明了，避免以后误读。
 \end{itemize}

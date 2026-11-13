@@ -82,6 +82,25 @@ WARNING: possible irq lock inversion dependency detected
 
 接管率的定义要写死：$\text{hit}/(\text{hit}+\text{miss}+\text{pending})$。\texttt{placements} 文件是实时快照，任务退出后即空，因此它不能作为留存证据；能留存的是三个累计值。
 
+这 31 个计数器不是仪表盘，而是一组\textbf{可证伪的断言}：本文每一条"系统在工作"的结论，都指定了它会看哪个读数、以及断言为假时读数会怎么变（\autoref{tab:assert}）。这样做的直接好处是排查不靠猜——第\ref{sec:test}节的"空转"问题就是从 \texttt{balance\_runs} 与 \texttt{ttwu\_ok} 的比值读出来的。
+ef{sec:test}节的"空转"问题就是从 	exttt{balance\_runs} 与 	exttt{ttwu\_ok} 的比值读出来的。
+
+\begin{table}[H]
+\centering
+\caption{三条关键断言及其可证伪读数}
+\label{tab:assert}
+\small
+\begin{tabular}{@{}>{\raggedright\arraybackslash}p{3.4cm}>{\raggedright\arraybackslash}p{4.8cm}>{\raggedright\arraybackslash}p{5.4cm}@{}}
+\toprule
+断言 & 支持它的读数 & 若断言为假会看到什么 \\
+\midrule
+回调确实被调用 & \texttt{select\_calls}=467 / \texttt{ttwu\_ok}=512 & \texttt{select\_calls} 接近 0 而 \texttt{enq\_calls} 正常 \\
+决策确实落地 & 接管率 $906/924=98.1\%$，\texttt{place\_miss}=0，\texttt{pick\_null\_desync}=0 & \texttt{place\_hit} 下降、\texttt{pending} 上升、\texttt{desync} 非 0 \\
+优化确实生效 & \texttt{balance\_runs} $757\to9$，\texttt{balance\_noop}=621 & \texttt{balance\_runs} 不降，或 \texttt{balance\_noop}=0 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
 \subsection{亲和性语义与测试}
 
 \texttt{--affinity} 三档必须分清，否则会得出完全错误的结论：

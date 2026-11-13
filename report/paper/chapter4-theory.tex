@@ -97,3 +97,5 @@ MSF & \texttt{yat\_find\_best\_core\_allowed()}：benefit 最大 & 只在"可运
   \item 决策频率由 \texttt{YAT\_DECISION\_MIN\_INTERVAL\_NS}=1\,ms 限流：两次全量选核之间至少隔 1\,ms，把"每任务每秒最多 1000 次决策"这件事写进常量而不是靠负载碰巧。
   \item 一轮 balance 最多分配 \texttt{YAT\_BALANCE\_MAX\_BATCH}=256 个作业，这是防死循环的上限，不是吞吐目标。
 \end{itemize}
+
+这四条上界合起来给出一个可预测性保证：历史表长度、单次决策频率、单轮批量都有硬上限，因此调度类的最坏开销不随负载形状失控。对调度器而言这是比平均性能更重要的性质——它决定了这个调度类能不能放进生产内核而不引入长尾。

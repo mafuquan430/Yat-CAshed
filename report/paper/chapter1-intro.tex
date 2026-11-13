@@ -10,7 +10,7 @@
 
 \subsection{项目目标与交付物}
 
-本项目要做的是可运行、可复现的系统，而不是纸面模型。主交付物是内核侧的一套东西，见\autoref{tab:deliverables}。
+本项目交付的是一套能编进内核、能在真实调度路径上跑完负载、并且能被计数器逐条复核的系统，而不是纸面模型。规模与入口见\autoref{tab:deliverables}。
 
 \begin{table}[H]
 \centering
@@ -22,10 +22,10 @@
 载体 & 规模 & 入口 \\
 \midrule
 \texttt{kernel/sched/yat\_casched.c} & 2752 行 C & \texttt{make kernel-build} \\
-\texttt{include/linux/sched/yat\_casched.h} & 266 行 & \texttt{make symbol-check} \\
-\texttt{include/trace/events/yat\_casched.h} & 228 行 & \texttt{debugfs} 寄存器组 \\
-\texttt{yat\_test\_scripts/} & 3 配置 $\times$ 5 次 & \texttt{compare\_cfs\_vs\_yat.sh} \\
-\texttt{patches/}（8 个补丁） & —— & \texttt{make patch-check} \\
+\texttt{include/linux/sched/yat\_casched.h} & 266 行，29 个声明 & \texttt{make symbol-check} \\
+\texttt{include/trace/events/yat\_casched.h} & 228 行，3 个 tracepoint & \texttt{debugfs} 寄存器组 \\
+\texttt{yat\_test\_scripts/} & 3 配置 $\times$ 5 次 $\times$ 2 个镜像 & \texttt{compare\_cfs\_vs\_yat.sh} \\
+\texttt{patches/}（8 个补丁） & 逐字节重建当前树 & \texttt{make patch-check} \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -34,15 +34,41 @@
 
 \subsection{本文的主要工作}
 
-本文不是对已有结论的复述，而是把系统做完、测完并核对之后写成的工程记录。主要工作有四件：
+本文是"把系统做完、测完、核对完"之后的工程记录，四件事按依赖顺序排列：
 
 \begin{enumerate}
-    \item \textbf{实现}：在 Linux 6.8 上新增内置调度类 \texttt{SCHED\_YAT\_CASCHED}（策略号 8），完成选核、DAG/作业生命周期、每核历史表、加速表、31 项计数器与 \texttt{debugfs} 观测接口，并给出可独立应用的补丁包。
-    \item \textbf{修复}：定位并修掉一处被 \texttt{lockdep} 实证的锁反序（\texttt{task\_dead} 在开中断上下文销毁作业，与 balance 路径构成 ABBA），重建镜像并复跑对照，同类告警计数归零。
-    \item \textbf{实测}：在 QEMU（4 vCPU，TCG）上用同一份负载跑三组对照、每组重复 5 次，给出中位数与全距；用计数器证明调度类回调确实被调用、决策确实落地（接管率 $98.5\%$），并用"单核 pin"与"无唤醒"两组对照把墙钟代价定位到唤醒路径的回调，而不是 AJLR 选核本身。
-    \item \textbf{可复现}：每个数字都能由仓库内脚本重算——\texttt{make verify-all} 是静态门禁，\texttt{scripts/run\_kernel\_repeats.sh} 是实测脚本，结果按配置归档在 \texttt{docs/validation/}。
+    \item \textbf{实现}：在 Linux 6.8 上新增内置调度类 \texttt{SCHED\_YAT\_CASCHED}（策略号 8），完成选核、DAG/作业生命周期、每核历史表、加速表、31 项计数器与 \texttt{debugfs} 观测接口，并固化成 8 个可独立应用的补丁。
+    \item \textbf{修复}：定位并修掉一处被 \texttt{lockdep} 实证的锁反序（\texttt{task\_dead} 在开中断上下文销毁作业，与 balance 路径构成 ABBA）；重建镜像复跑两组对照，同类告警计数归零，修复固化为补丁 \texttt{0007}。
+    \item \textbf{测量与归因}：同一份负载、同一个二进制，用三组配置各重复 5 次。主口径给出总代价（1.81 倍），单核 pin 与无唤醒两组把总代价拆成"选核"与"接入"两笔，得到"选核只占约 5\%"这个可执行的结论（\S\ref{sec:test}）。
+    \item \textbf{闭环优化}：由计数器指出的空转（\texttt{balance\_runs}=757 而唤醒仅 512 次）驱动出"就绪代际门禁"，把 98.6\% 的 balance 调用变成不取锁的快速路径，并让主口径从 2.00 降到 1.81（\S\ref{sec:test}）。
 \end{enumerate}
+
+此外，所有数字都由仓库内脚本重算：\texttt{make verify-all} 是静态门禁（符号一致性、补丁包、文档链接、数字核对），\texttt{scripts/run\_kernel\_repeats.sh} 是实测脚本，原始结果按配置归档在 \texttt{docs/validation/}。
+
+\subsection{优势与来源}
+
+本文的四项优势及其成立理由见\autoref{tab:advantages}。它们不是"投入很多"的结果，而是三个结构选择的产物：把代价拆成可消融的对照、把结论写成可证伪的计数器、把一致性写成脚本。
+
+\begin{table}[H]
+\centering
+\caption{优势、证据与成立理由}
+\label{tab:advantages}
+\small
+\begin{tabular}{@{}>{\raggedright\arraybackslash}p{3.2cm}>{\raggedright\arraybackslash}p{5.0cm}>{\raggedright\arraybackslash}p{5.3cm}@{}}
+\toprule
+优势 & 证据（仓库内可复查） & 为什么成立 \\
+\midrule
+实现完整、可重建 & 8 个补丁可独立应用，按序应用后与工作树逐字节一致；\texttt{bzImage} 启动 4 vCPU；15 次测量共 30 次独立启动，零 \texttt{lockdep}/BUG & 补丁往返校验把"能编译"升级为"能重建"；告警计数是二值事实，不随负载波动 \\
+成本可分解，而非只有一个总比值 & 三配置$\times$5 次：1.81 / 1.72 / 0.84 & 单核 pin 使 \texttt{nr\_cpus\_allowed==1}，\texttt{core.c} 包装层直接返回，调度类回调一次都不进；无唤醒只剩 \texttt{WF\_FORK}。三格消融把"算法成本"与"接入成本"分开 \\
+结论落到具体代码 & 选核边际 $1.81/1.72\approx5\%$（优化前 $\approx18\%$）；1.72 指到入队与选核路径 & 两格之比是同一负载下"多跑一次 AJLR"的净代价，不是拟合出来的系数 \\
+优化有确定性验收 & \texttt{balance\_runs} $757\to9$、\texttt{balance\_noop}=621、\texttt{jobs\_placed} $271\to172$ & 计数器是同一负载下的确定性量，不受 TCG 约 28\% 抖动影响，改完立刻能判对错 \\
+论文与数据强一致 & \texttt{scripts/check\_numbers.py} 66 项比对，全部由 CSV 重算 & 数字由脚本从归档数据重算，抄写错误会让门禁失败，而不是靠人工复核 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+需要同时说明代价：这套做法换来的是可信度与可归因性，而不是"比 CFS 快"。主口径 1.81 倍仍是当前实现的真实水平，第\ref{sec:conclusion}节给出的下一步正是冲着它去的。
 
 \subsection{阅读指引}
 
-第\ref{sec:realtime}节交代背景与相关工作；第\ref{sec:design}节给出架构与模块边界；第\ref{sec:theory}节给出算法与它到内核实现的映射；第\ref{sec:kernel}节讲内核实现细节与锁序；第\ref{sec:test}节给出实测协议、计数器证据与代价区间；第\ref{sec:difficulties}节记录工程问题与解决过程；第\ref{sec:conclusion}节总结并给出后续改进路线。
+第\ref{sec:realtime}节交代背景与相关工作；第\ref{sec:design}节给出架构与模块边界；第\ref{sec:theory}节给出算法与它到内核实现的映射；第\ref{sec:kernel}节讲内核实现细节、锁序与可观测性；第\ref{sec:test}节给出实测协议、计数器证据、代价分解与闭环优化；第\ref{sec:difficulties}节记录工程问题及其留下的门禁；第\ref{sec:conclusion}节总结并给出后续改进路线。

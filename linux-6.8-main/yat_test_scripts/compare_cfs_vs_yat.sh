@@ -62,6 +62,22 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# ---------------------------------------------------------------------------
+# 并发保护
+#
+# 两次运行共用 results/ 下的 initramfs、qemu_<policy>.log 与最终 CSV。
+# 并行跑会互相覆盖日志，表现为"未在日志中找到 YATCSV 行"这种**假失败**；
+# 更糟的是覆盖发生在解析途中，可能得到一个看起来正常的错数字。
+# 因此这里用 flock 把"一次完整的 cfs+yat 对比"做成不可重入。
+# ---------------------------------------------------------------------------
+YAT_RUN_LOCK="${TMPDIR:-/tmp}/yat_cfs_vs_yat.lock"
+exec 9>"$YAT_RUN_LOCK"
+if command -v flock >/dev/null 2>&1 && ! flock -n 9; then
+    echo "❌ 另一个 compare_cfs_vs_yat.sh 正在运行（锁：$YAT_RUN_LOCK）" >&2
+    echo "   两次运行会共用 results/ 下的日志与 initramfs，必须串行。" >&2
+    exit 3
+fi
 KERNEL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 TASKS=4
@@ -334,7 +350,7 @@ run_one() {
     if grep -q '^YATDEBUG-BEGIN' "$log"; then
         echo "  ── A6 计数器 (policy=$policy) ──" >&2
         sed -n '/YATDEBUG-BEGIN/,/^--- ready_pool ---/p' "$log" \
-            | grep -E 'balance_|jobs_|history_|accel_|select_|enq_|ttwu_|pick_|deq_|place_|nr_cpu_ids' \
+            | grep -E 'balance_|pool_|jobs_|history_|accel_|select_|enq_|ttwu_|pick_|deq_|place_|nr_cpu_ids' \
             | sed 's/^/     /' >&2
 
         # 读取单个计数器（stats 每行 "name  value"）。

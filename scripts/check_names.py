@@ -91,6 +91,13 @@ EXEMPT_DIRS = (
     ".git/",
 )
 
+# 归档的第三方/历史**原始件**（补丁、日志、CSV）按原样保存，不改写其中字面量
+EXEMPT_SUFFIXES_UNDER = (
+    ("docs/validation/", ".patch"),
+    ("docs/validation/", ".csv"),
+    ("docs/validation/", ".log"),
+)
+
 # `linux-6.8-main/` 下只查我们自己新增的东西（其余是上游源码）
 KERNEL_ALLOW_PREFIXES = (
     "linux-6.8-main/boot_test_scripts/",
@@ -132,6 +139,9 @@ def in_scope(path: str) -> bool:
         return False
     if Path(path).suffix.lower() in BINARY_EXT:
         return False
+    for prefix, suffix in EXEMPT_SUFFIXES_UNDER:
+        if path.startswith(prefix) and path.endswith(suffix):
+            return False
     if path.startswith("linux-6.8-main/"):
         if path in KERNEL_ALLOW_FILES:
             return True

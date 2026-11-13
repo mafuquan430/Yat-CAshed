@@ -75,7 +75,7 @@
 ### A3. 将调度器产出一份「纯补丁」（P1）✅ 已完成
 当前改动**散落在 8+ 个标准内核文件**中，难以评审与回溯 —— 已解决：
 
-- ✅ 产出 [`patches/`](../patches)：**7 个补丁 / 274 KB**，覆盖全部 Yat 改动
+- ✅ 产出 [`patches/`](../patches)：**8 个补丁 / 280 KB**，覆盖全部 Yat 改动
   - `0001-sched-yat-casched-core.patch` —— 调度类主体
   - `0002-sched-yat-casched-integration.patch` —— 8 处标准内核集成点
   - `0003-x86-realmode-tolerate-missing-trampoline.patch` —— 编译兼容

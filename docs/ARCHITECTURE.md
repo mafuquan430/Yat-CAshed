@@ -81,7 +81,8 @@ graph TD
 
 | 组 | 字段 | 回答的问题 |
 |----|------|-----------|
-| 负载均衡 | `balance_runs/balance_skips/jobs_placed/jobs_nocore` | 全局分配跑了几轮、成功/无核各多少 |
+| 负载均衡 | `balance_runs/balance_skips/balance_noop/jobs_placed/jobs_nocore` | 全局分配跑了几轮、抢锁失败几次、空转几次、成功/无核各多少 |
+| 就绪池扫描（Route A） | `pool_scans/pool_scan_skips` | 全表扫描执行了几次、被代际门禁挡掉几次 |
 | 历史的/加速表 | `history_records/accel_inserts/accel_dup` | CRP 数据是否在积累 |
 | 选核回调 | `select_calls/select_not_ttwu/select_nojob/select_sticky_idle/select_sticky_interval/select_nocore/select_decided` | 回调**有没有被调用**、在每个出口退出多少次 |
 | 唤醒链路 | `ttwu_state_bail/ttwu_runnable/ttwu_wakelist/ttwu_ok` | `try_to_wake_up()` 从哪个出口离开（只统计 yat 任务） |

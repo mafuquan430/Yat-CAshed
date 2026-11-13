@@ -1,7 +1,19 @@
 From: Yat-CAShed <noreply@example.com>
-Subject: [PATCH] test: add Yat QEMU boot/test environments and CFS-vs-Yat benchmark
+Subject: [PATCH] test-env: QEMU test environments and CFS-vs-Yat benchmark
+
 Upstream: linux v6.8 (torvalds)
 
+新增（只含源码与脚本，不含编译产物）：
+  - boot_test_scripts/: yat_simple_test.c / yat_bench.c / yat_affinity_test.c 与说明
+  - yat_test_scripts/: initramfs 生成、QEMU 启动、cfs vs yat 对比等脚本
+  - test_visualization/: 可视化脚本与样例数据
+
+本版修掉上一版补丁的两个问题：
+  1. 文件在 yat_affinity_test.c 的最后一个 hunk 中被截断，
+     git apply 报 "corrupt patch at line 3276"；
+  2. compare_cfs_vs_yat.sh 缺少并发锁（两个实例并行会互相覆盖 results/）。
+
+---
 --- /dev/null
 +++ b/boot_test_scripts/README.md
 @@ -0,0 +1,137 @@
@@ -142,6 +154,7 @@ Upstream: linux v6.8 (torvalds)
 +- 性能对比实验设计与结论：[`../../docs/EXPERIMENT_REPORT.md`](../../docs/EXPERIMENT_REPORT.md)
 +- 性能测试与图表：[`../test_visualization/README.md`](../test_visualization/README.md)
 +- 内核构建说明：[`../../docs/DEVELOPMENT.md`](../../docs/DEVELOPMENT.md)
+
 --- /dev/null
 +++ b/boot_test_scripts/SIMPLE_TEST_README.md
 @@ -0,0 +1,64 @@
@@ -209,6 +222,7 @@ Upstream: linux v6.8 (torvalds)
 +## 退出 QEMU
 +
 +`Ctrl+A` 然后按 `X`；或在 guest shell 中执行 `halt`。
+
 --- /dev/null
 +++ b/boot_test_scripts/yat_bench.c
 @@ -0,0 +1,592 @@
@@ -804,6 +818,7 @@ Upstream: linux v6.8 (torvalds)
 +
 +	return 0;
 +}
+
 --- /dev/null
 +++ b/boot_test_scripts/yat_simple_test.c
 @@ -0,0 +1,162 @@
@@ -969,6 +984,7 @@ Upstream: linux v6.8 (torvalds)
 +    
 +    return 0;
 +}
+
 --- /dev/null
 +++ b/yat_test_scripts/README.md
 @@ -0,0 +1,225 @@
@@ -1197,6 +1213,7 @@ Upstream: linux v6.8 (torvalds)
 +| 权限错误 | `chmod +x ./*.sh` |
 +| 编译失败 | 检查 `gcc` 与 `../boot_test_scripts/*.c`；失败项会被跳过并打印原因 |
 +| CSV 里某字段空 / `integer expression expected` | 串口是 CRLF，脚本已 `tr -d '\r'`；若自行改脚本要记得保留 |
+
 --- /dev/null
 +++ b/yat_test_scripts/build_yat_simple_test.sh
 @@ -0,0 +1,114 @@
@@ -1314,9 +1331,10 @@ Upstream: linux v6.8 (torvalds)
 +echo ""
 +echo "启动测试:"
 +echo "  cd $SCRIPT_DIR && ./start_yat_simple_test.sh"
+
 --- /dev/null
 +++ b/yat_test_scripts/compare_cfs_vs_yat.sh
-@@ -0,0 +1,503 @@
+@@ -0,0 +1,519 @@
 +#!/bin/bash
 +#
 +# CFS vs Yat-CASched 同负载自动对比
@@ -1381,6 +1399,22 @@ Upstream: linux v6.8 (torvalds)
 +set -uo pipefail
 +
 +SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++
++# ---------------------------------------------------------------------------
++# 并发保护
++#
++# 两次运行共用 results/ 下的 initramfs、qemu_<policy>.log 与最终 CSV。
++# 并行跑会互相覆盖日志，表现为"未在日志中找到 YATCSV 行"这种**假失败**；
++# 更糟的是覆盖发生在解析途中，可能得到一个看起来正常的错数字。
++# 因此这里用 flock 把"一次完整的 cfs+yat 对比"做成不可重入。
++# ---------------------------------------------------------------------------
++YAT_RUN_LOCK="${TMPDIR:-/tmp}/yat_cfs_vs_yat.lock"
++exec 9>"$YAT_RUN_LOCK"
++if command -v flock >/dev/null 2>&1 && ! flock -n 9; then
++    echo "❌ 另一个 compare_cfs_vs_yat.sh 正在运行（锁：$YAT_RUN_LOCK）" >&2
++    echo "   两次运行会共用 results/ 下的日志与 initramfs，必须串行。" >&2
++    exit 3
++fi
 +KERNEL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 +
 +TASKS=4
@@ -1653,7 +1687,7 @@ Upstream: linux v6.8 (torvalds)
 +    if grep -q '^YATDEBUG-BEGIN' "$log"; then
 +        echo "  ── A6 计数器 (policy=$policy) ──" >&2
 +        sed -n '/YATDEBUG-BEGIN/,/^--- ready_pool ---/p' "$log" \
-+            | grep -E 'balance_|jobs_|history_|accel_|select_|enq_|ttwu_|pick_|deq_|place_|nr_cpu_ids' \
++            | grep -E 'balance_|pool_|jobs_|history_|accel_|select_|enq_|ttwu_|pick_|deq_|place_|nr_cpu_ids' \
 +            | sed 's/^/     /' >&2
 +
 +        # 读取单个计数器（stats 每行 "name  value"）。
@@ -1820,6 +1854,7 @@ Upstream: linux v6.8 (torvalds)
 +echo "注意：TCG 模拟下单次测量噪声较大，结论请以多次重复的中位数/分布为准，"
 +echo "      不要用单次 sum_wall 的小幅差异当作算法结论。"
 +echo "=========================================="
+
 --- /dev/null
 +++ b/yat_test_scripts/create_test_initramfs.sh
 @@ -0,0 +1,142 @@
@@ -1965,6 +2000,7 @@ Upstream: linux v6.8 (torvalds)
 +echo "  qemu-system-x86_64 -nographic -m 1024 -smp 4 \\"
 +echo "      -kernel arch/x86/boot/bzImage \\"
 +echo "      -initrd $OUT_IMAGE -append \"console=ttyS0,115200 panic=1 nokaslr\" -accel tcg"
+
 --- /dev/null
 +++ b/yat_test_scripts/manual_test_guide.sh
 @@ -0,0 +1,53 @@
@@ -2021,6 +2057,7 @@ Upstream: linux v6.8 (torvalds)
 +echo "- 所有命令都在 QEMU 虚拟机的终端中运行"
 +echo "- 要退出虚拟机: 输入 'exit'，然后按 Ctrl+A 再按 X"
 +echo "- 观察调度器行为时注意进程的 CPU 使用率分布"
+
 --- /dev/null
 +++ b/yat_test_scripts/quick_test_guide.sh
 @@ -0,0 +1,70 @@
@@ -2094,6 +2131,7 @@ Upstream: linux v6.8 (torvalds)
 +
 +echo "🚪 退出方式："
 +echo "在虚拟机中输入 'exit'，然后按 Ctrl+A 再按 X"
+
 --- /dev/null
 +++ b/yat_test_scripts/start_qemu_simple.sh
 @@ -0,0 +1,111 @@
@@ -2208,6 +2246,7 @@ Upstream: linux v6.8 (torvalds)
 +    -no-reboot \
 +    -append "console=ttyS0,115200 panic=1 nokaslr quiet" \
 +    -accel tcg
+
 --- /dev/null
 +++ b/yat_test_scripts/start_qemu_yat_test.sh
 @@ -0,0 +1,63 @@
@@ -2274,10 +2313,11 @@ Upstream: linux v6.8 (torvalds)
 +
 +echo ""
 +echo "QEMU 测试环境已关闭。"
+
 --- /dev/null
 +++ b/yat_test_scripts/start_test_environment.sh
 @@ -0,0 +1,78 @@
-+#!/bin/bash
++ig#!/bin/bash
 +#
 +# 一键启动「交互式」Yat-CAShed 测试环境（进 shell 手动跑命令、看 proc/debugfs）。
 +#
@@ -2355,6 +2395,7 @@ Upstream: linux v6.8 (torvalds)
 +    -no-reboot \
 +    -accel tcg \
 +    -append "console=ttyS0,115200 panic=1 nokaslr"
+
 --- /dev/null
 +++ b/yat_test_scripts/start_yat_simple_test.sh
 @@ -0,0 +1,61 @@
@@ -2419,6 +2460,7 @@ Upstream: linux v6.8 (torvalds)
 +echo ""
 +echo "QEMU 已退出"
 +echo "查看完整日志: cat $LOG_FILE"
+
 --- /dev/null
 +++ b/test_visualization/README.md
 @@ -0,0 +1,184 @@
@@ -2606,6 +2648,7 @@ Upstream: linux v6.8 (torvalds)
 +
 +> 说明：`img/` 下为历史运行产物，已纳入版本控制用于留档；
 +> 重新运行 `visualize_results.py` 会覆盖同名文件。
+
 --- /dev/null
 +++ b/test_visualization/debug_scheduler.c
 @@ -0,0 +1,68 @@
@@ -2677,6 +2720,7 @@ Upstream: linux v6.8 (torvalds)
 +    test_scheduler_behavior();
 +    return 0;
 +}
+
 --- /dev/null
 +++ b/test_visualization/performance_test.c
 @@ -0,0 +1,273 @@
@@ -2953,6 +2997,7 @@ Upstream: linux v6.8 (torvalds)
 +    printf("\nTest completed. Check test_visualization/ folder for results.\n");
 +    return 0;
 +}
+
 --- /dev/null
 +++ b/test_visualization/visualize_results.py
 @@ -0,0 +1,214 @@
@@ -3170,6 +3215,7 @@ Upstream: linux v6.8 (torvalds)
 +
 +if __name__ == "__main__":
 +    main()
+
 --- /dev/null
 +++ b/test_visualization/performance_results.csv
 @@ -0,0 +1,17 @@
@@ -3190,6 +3236,7 @@ Upstream: linux v6.8 (torvalds)
 +Yat-CAShed,6,3,1.148,0.940
 +CFS,7,5,1.138,0.865
 +Yat-CAShed,7,4,1.143,0.626
+
 --- /dev/null
 +++ b/test_visualization/img/performance_summary.md
 @@ -0,0 +1,27 @@
@@ -3221,6 +3268,7 @@ Upstream: linux v6.8 (torvalds)
 +## Conclusion
 +Yat-CAShed shows clear advantages in reducing CPU migrations and improving performance.
 \ No newline at end of file
+
 --- /dev/null
 +++ b/boot_test_scripts/yat_affinity_test.c
 @@ -0,0 +1,51 @@
@@ -3275,3 +3323,4 @@ Upstream: linux v6.8 (torvalds)
 +    printf("YAT-AFFINITY %s rc=%d\n", rc ? "FAIL" : "PASS", rc);
 +    return rc;
 +}
+\ No newline at end of file

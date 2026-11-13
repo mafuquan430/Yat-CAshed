@@ -175,7 +175,79 @@ make verify-all                # 以上全部串行执行
 > 合并冲突已全部解决，接口声明与实现一致，无白名单例外。
 > LaTeX 编译未纳入 CI（体积与耗时原因），但 `make report` 已可稳定复现。
 
-## 6. 命名与提交规范
+## 6. 优化记录：就绪代际门禁（Route A，镜像 #20 起）
+
+### 6.1 问题
+
+`balance_yat_casched()` 是调度类在每个调度点都会走的回调。原实现无条件调用
+`yat_update_ready_pool()`，而后者要：
+
+1. 取全局的 `global_dag_lock`；
+2. 遍历 `global_dag_list` 上的每个 DAG；
+3. 对每个 DAG 取 `dag->lock`，再遍历它下面的**所有**作业；
+4. 对每个 `WAITING && pending_predecessors == 0` 的作业调 `yat_ready_pool_enqueue()`。
+
+主口径实测 `balance_runs = 757`，而唤醒只有 512 次——也就是说约 1/3 的 balance
+调用发生时，池里根本没有新就绪的作业，上面四步纯属白做。在 TCG 下每次取自旋锁
+都要跨 vCPU，这笔开销不可忽略。
+
+### 6.2 机制：一个代际号
+
+```c
+static atomic_t yat_ready_gen   = ATOMIC_INIT(0);   /* 就绪事件代际 */
+static atomic_t yat_scanned_gen = ATOMIC_INIT(-1);  /* 上次扫描看到的代际 */
+```
+
+- **推进**（只有两个地方会让作业"变成就绪"）：
+  - `__yat_create_job()`：新建作业且 `pending_predecessors == 0`；
+  - `yat_job_complete()`：某后继的最后一个前驱完成，计数减到 0。
+- **消费**：`yat_ready_scan_needed()` 读代际，与 `yat_scanned_gen` 比较；
+  不同则把后者推进到当前快照并返回 `true`。
+- **快速路径**：`balance_yat_casched()` 在**取 `yat_balance_lock` 之前**判断
+  "池空 + 代际未变"，成立就直接返回，只加一个 `balance_noop` 计数。
+
+### 6.3 为什么不会漏作业
+
+| 担心的情况 | 为什么不发生 |
+|---|---|
+| 扫描期间又有作业就绪 | 代际又变了，下一轮 balance 必然重扫（`yat_scanned_gen` 停在旧值） |
+| 重复扫描把同一作业入池两次 | `yat_ready_pool_enqueue()` 前有 `state == WAITING` 判断，入池后置 READY |
+| 池里还有作业但被快速路径跳过 | 快速路径要求 `nr_jobs == 0`，池非空一律走完整路径 |
+| 找不到核心的作业被丢弃 | 这类作业被 `enqueue` 放回池中，`nr_jobs > 0`，不会被跳过 |
+
+### 6.4 验收读数
+
+主口径单次（镜像 #20，`--affinity none --sleep-us 200`）：
+
+| 计数器 | 改前（#19） | 改后（#20） | 读法 |
+|---|---|---|---|
+| `balance_runs` | 757 | 9 | 真正做全局分配的轮次 |
+| `balance_noop` | —— | 634 | 池空且无新就绪，连锁都没取的轮次 |
+| `jobs_placed` | 271 | 207 | 实际落地分配数 |
+| `place_hit / pending` | 996 / 21 | 903 / 15 | 接管率 97.9% → 98.4% |
+| 墙钟比（中位数，5 次） | 2.00 | 1.81 | 全距 [1.76, 2.13] |
+| 选核边际代价 | ≈18% | ≈5% | 1.81/1.72 − 1 |
+
+注意 `jobs_placed` 变小**不是**退步：旧实现每轮都把已在睡眠的任务重新"放置"一遍，
+这些放置没有任何作用，只是把计数器撑大。
+
+### 6.5 复算
+
+```bash
+make kernel-obj && make kernel-build          # 镜像 #20
+bash scripts/run_kernel_repeats.sh --repeats 5 \
+     --out docs/validation/2026-11-13/kernel/repeat-routeA
+python3 scripts/check_numbers.py              # 会同时校验两个目录
+```
+
+差分对比：
+
+```bash
+diff -u docs/validation/2026-11-13/kernel/repeat/SUMMARY.txt \
+        docs/validation/2026-11-13/kernel/repeat-routeA/SUMMARY.txt
+```
+
+## 7. 命名与提交规范
 
 - 项目名统一为 **Yat-CAShed**（文档标题中可用 `Yat-CAShed`，但代码标识符统一 `yat_casched`）。
 - 提交信息采用约定式前缀（沿用现有风格）：

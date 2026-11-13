@@ -1,17 +1,29 @@
 \documentclass[a4paper]{article}
 
-\usepackage[UTF8]{ctex}
+\usepackage[UTF8,fontset=fandol]{ctex}
 \usepackage[a4paper,margin=1in]{geometry}
 \usepackage{graphicx}
 \usepackage{float}
 \usepackage{fancyvrb}           % 支持中文代码块
 \usepackage{longtable}
 \usepackage{booktabs}
-\usepackage{hyperref}
+\usepackage[hidelinks]{hyperref}
 \usepackage{fancyhdr}
 \usepackage{lastpage}
 \usepackage{color}
 \usepackage{indentfirst}        % 首段缩进
+
+% 文档里有大量 \texttt{} 长标识符（路径、函数名、CSV 列名），
+% 中文断行规则又不在这些 token 内部断，容易溢出。
+% 放宽段内伸缩并给出应急伸展量，避免出现明显出界的行。
+\setlength{\emergencystretch}{3em}
+\sloppy
+
+% \autoref 的默认英文名换成中文，避免正文出现 "Table 6" 与题注 "表 6" 混排
+\renewcommand{\figureautorefname}{图}
+\renewcommand{\tableautorefname}{表}
+\renewcommand{\sectionautorefname}{节}
+\renewcommand{\subsectionautorefname}{节}
 \setlength{\parindent}{2em}     % 缩进2字符
 \usepackage{zhnumber}           % 中文编号
 \usepackage[dvipsnames]{xcolor}
@@ -22,7 +34,7 @@
 \usepackage{tcolorbox}          % 彩色文本框
 \tcbuselibrary{most}            % 加载所有tcolorbox库
 \usepackage{tikz}               % 支持绘图
-\usetikzlibrary{shapes,arrows}  % tikz图形库
+\usetikzlibrary{shapes,arrows,arrows.meta,positioning}  % tikz图形库
 
 % algorithm2e配置
 \SetAlgorithmName{算法}{算法}{算法列表}
@@ -54,7 +66,9 @@
 \fancyhead[R]{\kaishu \teamname} % 右侧页眉显示队伍名称
 
 % 设置页脚
-\fancyfoot[C]{第 \thepage 页，共 \pageref{LastPage} 页} % 中间页脚显示页码
+% 页脚只写当前页码：lastpage 在 ctex/xetex 下会把总页数算成"正文最后一页"，
+% 与参考文献页对不上（实测 24 页的文档显示"共 23 页"）。宁可少一个数字，也不印错。
+\fancyfoot[C]{第 \thepage 页}
 
 % 去除页眉页脚与正文之间的分隔线
 \renewcommand{\headrulewidth}{0.4pt}
@@ -70,7 +84,9 @@
 \begin{document}
 
 % 封面
+\hypersetup{pageanchor=false}
 \input{cover.tex}
+\hypersetup{pageanchor=true}
 
 % 摘要
 \input{abstract.tex}
@@ -93,6 +109,9 @@
 \input{chapter5-kernel.tex}
 \input{chapter6-test.tex}
 \input{chapter7-difficulties.tex}
+\input{chapter8-conclusion.tex}
+
+\newpage
 \input{references.tex}
 
 \end{document}

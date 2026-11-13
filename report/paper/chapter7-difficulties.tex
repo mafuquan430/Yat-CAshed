@@ -1,48 +1,69 @@
-% 第七章：遇到的困难和解决方法
-% 负责人：马福泉
+% 第七章：工程问题与解决过程
 
-\section{遇到的困难和解决方法} \label{sec:difficulties}
+\section{工程问题与解决过程} \label{sec:difficulties}
 
-\subsection{技术难点}
+本章按"现象—根因—处理—证据"记录六个真实问题。它们的共同点是：都能靠"跑一遍、对一遍数"发现，靠"读一遍代码"定性，而不是靠加限定词掩盖。
 
-\subsubsection{缓存行为建模复杂性}
-\textbf{困难描述}：现代处理器的缓存行为受到多种因素影响，包括预取、替换策略、缓存一致性协议等，难以准确建模。
+\subsection{十个合并冲突：路线选择}
 
-\textbf{解决方法}：
-\begin{itemize}
-    \item 采用基于机器学习的CRP模型，通过大量实验数据训练
-    \item 使用分段线性函数简化模型复杂度
-    \item 引入在线学习机制，动态调整模型参数
-\end{itemize}
+\textbf{现象}：\texttt{kernel/sched/yat\_casched.c} 遗留 10 处冲突标记，两套实现（初赛版与决赛版）交织，直接编译会报语法错。
 
-\subsubsection{实时性保证}
-\textbf{困难描述}：缓存感知调度需要额外的计算开销，可能影响实时性保证。
+\textbf{根因}：并行开发时同一文件被两条演进线修改，合并没有按语义收敛，而是按行保留了两边。
 
-\textbf{解决方法}：
-\begin{itemize}
-    \item 优化算法时间复杂度，使用高效的数据结构
-    \item 采用预计算和查表技术减少在线计算
-    \item 设计增量更新机制，避免重复计算
-\end{itemize}
+\textbf{处理}：取"决赛 AJLR 版"为唯一事实，逐处判断哪些初赛函数仍被调用、哪些只是历史残留；删除无调用者的死代码，保留被 \texttt{sched\_class} 或测试引用的接口。收敛后 \texttt{make symbol-check} 通过，头文件 29 个声明全部有定义。
 
-\subsection{工程实现挑战}
+\textbf{证据}：\texttt{docs/CONFLICT\_ANALYSIS.md} §7--§8 记录逐处决策。
 
-\subsubsection{多核同步}
-\textbf{困难描述}：多核环境下的数据同步和状态一致性维护困难。
+\subsection{早期仿真数据的口径问题（已更正）}
 
-\textbf{解决方法}：
-\begin{itemize}
-    \item 采用无锁数据结构减少同步开销
-    \item 设计分布式状态管理机制
-    \item 使用原子操作保证关键数据的一致性
-\end{itemize}
+\textbf{现象}：项目前期对外宣称的 Makespan 改进 11.66\%、命中率提升 30.21 个百分点、胜率 96\%，在复核后无法复现；用同一份代码重跑，数字变成 $-0.954\%$，换一个入口再跑又变成 $-3.524\%$。
 
-\subsubsection{系统集成}
-\textbf{困难描述}：调度器需要与操作系统内核紧密集成，涉及底层系统调用和硬件接口。
+\textbf{根因}有三层，一层比一层靠近真问题：
 
-\textbf{解决方法}：
-\begin{itemize}
-    \item 开发内核模块形式的调度器
-    \item 设计标准化的接口层
-    \item 提供用户态测试框架便于调试
-\end{itemize}
+\begin{enumerate}
+  \item \textbf{两套模型口径}。旧实验里 CacheAware 用自估函数把执行时间打折（最高减免 50\%），WFD 用原始值；命中率不由缓存模型给出，而是分析器按算法名套两套手写公式，其中 WFD 那套还被截断到 $[0.30,0.70]$。所谓"更快、更准"是口径差异的产物。
+  \item \textbf{基线状态泄漏}。\texttt{WFD} 的处理器负载表是 \texttt{static}，只在每个种子结束时清理一次，于是第 $i$ 个用例的基线继承了前 $i-1$ 个用例累积的负载偏置，而挑战者每个用例都复位。同一批用例，这个偏差稳定地把结果抬高约 2.5 个百分点。
+  \item \textbf{决策变量缺项}。旧启发式的评分为五维加权，五项全部来自任务的静态属性（敏感度、权重、随机亲和性、自维护的"缓存利用率"），没有任何一项依赖"这个 DAG 上次在哪个核跑过"；而缓存模型的命中判据只有一条——最近 5 次访问中是否有同一 \texttt{dagID}。两边正交，任何权重调参都无法把局部性变成收益。
+\end{enumerate}
+
+\textbf{处理}：把仿真器整体移出证据链。它的执行时间与命中判定都由自建模型给出，不含抢占、迁移、TLB 与真实 LLC 竞争，即使口径全部修正，也只是"理想模型下的行为"，不能支撑"在真实系统上有效"的结论。正文只保留第\ref{sec:test}节的一小段交代，数字与复现命令留在 \texttt{docs/validation/}。
+
+\textbf{证据}：\texttt{docs/validation/2026-11-13/SUMMARY.md} 记录三套口径（11.66\% / $-0.954\%$ / $-3.524\%$）的逐种子对照与逐字节复现结果；仓库同时保留 \texttt{--legacy-metrics} 与 \texttt{--legacy-wfd-state} 两个开关，使历史数字随时可对齐——保留它们的目的不是"留个说法"，而是让"哪一版对、差在哪"可被第三方独立验证。
+
+\subsection{QEMU 的两个参数坑}
+
+\textbf{现象 1}：\texttt{-kernel vmlinux} 直接报 \texttt{Error loading uncompressed kernel without PVH ELF Note}，不启动。
+
+\textbf{根因}：QEMU 对 x86 ELF 内核要求 PVH note，本项目的 vmlinux 没有；\texttt{bzImage} 走的是另一条加载路径。
+
+\textbf{处理}：一律用 \texttt{arch/x86/boot/bzImage}。
+
+\textbf{现象 2}：加了 \texttt{acpi=off} 后 guest 只有 1 个 CPU（\texttt{nr\_cpu\_ids=1}），"多核调度"实验失去意义。
+
+\textbf{根因}：\texttt{-kernel bzImage} 绕过 BIOS，AP 枚举只能靠 ACPI MADT；关掉 ACPI 就没有 AP。
+
+\textbf{处理}：保留 ACPI，不加 \texttt{acpi=off}/\texttt{noapic}/\texttt{nolapic}，实测 4 核正常起来且 \texttt{poweroff} 能真正退出。这两条写进脚本头注释，避免后人"顺手优化"回去。
+
+\subsection{锁反序：lockdep 报出来的环}
+
+\textbf{现象}：镜像 \#18 的串口日志在基准跑完后立即出现 \texttt{WARNING: possible irq lock inversion dependency detected}，涉及 \texttt{pool->lock} 与 \texttt{rq->\_\_lock}。
+
+\textbf{根因}：\texttt{pool->lock} 在 balance 路径里总是关中断获取（HARDIRQ-safe），而 \texttt{task\_dead} 在开中断上下文里获取它，构成"任务持池锁 $\to$ 中断 $\to$ 取 rq 锁 $\to$ 需要池锁"的环。此前只把 debugfs 的 \texttt{show()} 改成 \texttt{irqsave}，属于堵旁路而非断环。
+
+\textbf{处理}：把 \texttt{task\_dead} 里的整段销毁放进 \texttt{local\_irq\_save()}/\texttt{local\_irq\_restore()}。临界区内只有链表操作与 \texttt{kfree}，没有睡眠式操作。
+
+\textbf{证据}：修复后重建（镜像 \#19，SHA256 \texttt{077638d4\ldots}），复跑两组对照，串口日志中同类告警计数为 0；修复本身固化为补丁 \texttt{0007}，用"修复前文件 + 补丁 == 当前文件"做过往返验证。
+
+\subsection{CRP 归一化窗口与注释不符}
+
+\textbf{现象}：\texttt{yat\_get\_crp\_ratio()} 里 \texttt{max\_recency = 1000000}，注释写"1 秒，根据实际情况调整"。\texttt{ktime} 的单位是纳秒，$10^6$\,ns 是 1\,ms，不是 1\,s。
+
+\textbf{影响}：任何超过 1\,ms 的重用距离都被压成 $\rho=1000$（完全冷），此时 $\mathrm{benefit}=0$，MSF 退化为按负载挑选。对 200\,$\mu$s 唤醒的本轮负载，实测 recency 约在 $2\times10^5$\,ns 量级，尚未饱和；但只要睡眠间隔或核数再涨，CRP 项就会静默失效。
+
+\textbf{处理}：本轮把常量与单位写清并登记为待标定项（第\ref{sec:conclusion}节路线 D），不在没有标定数据时改数值——改一个魔法常量换一组好看的数字，正是本章第二节批评的做法。
+
+\subsection{文档漂移}
+
+\textbf{现象}：同一组数字在 README、\texttt{EXPERIMENT\_REPORT.md}、\texttt{ROADMAP.md}、\texttt{index.html} 里出现过 11.66/30.21/96\%、0.39/0.82/56\%、$-0.954$/0.374/48.6\% 三种口径，区间也有 $\pm1.745$ 与 $\pm1.23$ 两版。
+
+\textbf{处理}：以 CSV 重算值为唯一事实，把三种口径的适用条件写进各自文档；\texttt{make docs-check} 校验链接、\texttt{make check} 校验冲突标记；一致性靠单一引用点（\texttt{docs/validation/2026-11-13/SUMMARY.md}）加各文档顶部的时效声明，而不是靠人工同步。

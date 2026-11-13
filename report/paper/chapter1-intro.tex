@@ -1,28 +1,48 @@
 % 第一章：项目介绍
-% 负责人：林炜东
 
 \section{项目介绍} \label{sec:intro}
 
-\subsection{项目背景}
+\subsection{问题背景}
 
-随着多核处理器的普及和实时系统复杂度的不断提升，传统的调度算法在多核环境下面临着严重的性能瓶颈。特别是在处理有向无环图(DAG)任务时，缓存的局部性和重用性成为影响系统性能的关键因素。现有的调度算法往往忽略了缓存层次结构对任务执行时间的重要影响，导致系统整体性能无法达到最优。
+多核处理器上，任务的执行时间不仅取决于指令条数，还取决于它运行时数据在缓存层次中的位置。对于有向无环图（DAG）任务，同一作业的不同节点往往复用同一批输入数据；若这些节点被分散到不同核心，每个核心都要重新把数据从末级缓存或内存搬入私有缓存，原本可以命中的访问退化为长延迟访问。调度器在"把任务放在哪个核心"上做的选择，因此直接决定了缓存重用能否发生。
 
-\subsection{项目目标}
+传统做法把这个问题拆成两半：实时调度文献关注截止期与可调度性，通常假设执行时间与放置无关；缓存感知研究关注重用距离与缓存冲突，但往往在离线或固定分配的前提下建模。Yat-CAShed 的出发点是把两者接起来：用缓存重用距离估计"这次放置能省多少时间"，再把这个估计值接进在线选核决策，并落到真实的 Linux 调度类里。
 
-本项目旨在设计并实现一种面向多核实时系统的轻量化缓存感知型调度方法Yat-CASched，主要目标包括：
+\subsection{项目目标与交付物}
+
+本项目要做的是可运行、可复现的系统，而不是纸面模型。主交付物是内核侧的一套东西，见\autoref{tab:deliverables}。
+
+\begin{table}[H]
+\centering
+\caption{交付物与规模}
+\label{tab:deliverables}
+\small
+\begin{tabular}{@{}lrl@{}}
+\toprule
+载体 & 规模 & 入口 \\
+\midrule
+\texttt{kernel/sched/yat\_casched.c} & 2752 行 C & \texttt{make kernel-build} \\
+\texttt{include/linux/sched/yat\_casched.h} & 266 行 & \texttt{make symbol-check} \\
+\texttt{include/trace/events/yat\_casched.h} & 228 行 & \texttt{debugfs} 寄存器组 \\
+\texttt{yat\_test\_scripts/} & 3 配置 $\times$ 5 次 & \texttt{compare\_cfs\_vs\_yat.sh} \\
+\texttt{patches/}（7 个补丁） & —— & \texttt{make patch-check} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+表中没有仿真器。作者在项目前期写过一个 Java 模拟器（\texttt{simulator/}）用于设计期校验，但它的执行时间与命中判定都是理想化模型，与内核不同构，不能作为"算法在真实系统上有效"的证据。本轮复核后已把它从证据链中移除，正文只在第\ref{sec:test}节用一小段交代其结论与去处，全部数据留在仓库文档里。
+
+\subsection{本文的主要工作}
+
+本文不是对已有结论的复述，而是把系统做完、测完并核对之后写成的工程记录。主要工作有四件：
 
 \begin{enumerate}
-    \item 设计基于缓存重用距离的预测模型，准确估算任务在不同核心上的执行时间
-    \item 实现高效的在线调度算法，最大化缓存利用率
-    \item 开发完整的调度器原型系统，支持DAG任务的实时调度
-    \item 通过实验验证算法的有效性和性能优势
+    \item \textbf{实现}：在 Linux 6.8 上新增内置调度类 \texttt{SCHED\_YAT\_CASCHED}（策略号 8），完成选核、DAG/作业生命周期、每核历史表、加速表、28 项计数器与 \texttt{debugfs} 观测接口，并给出可独立应用的补丁包。
+    \item \textbf{修复}：定位并修掉一处被 \texttt{lockdep} 实证的锁反序（\texttt{task\_dead} 在开中断上下文销毁作业，与 balance 路径构成 ABBA），重建镜像并复跑对照，同类告警计数归零。
+    \item \textbf{实测}：在 QEMU（4 vCPU，TCG）上用同一份负载跑三组对照、每组重复 5 次，给出中位数与全距；用计数器证明调度类回调确实被调用、决策确实落地（接管率 $98.5\%$），并用"单核 pin"与"无唤醒"两组对照把墙钟代价定位到唤醒路径的回调，而不是 AJLR 选核本身。
+    \item \textbf{可复现}：每个数字都能由仓库内脚本重算——\texttt{make verify-all} 是静态门禁，\texttt{scripts/run\_kernel\_repeats.sh} 是实测脚本，结果按配置归档在 \texttt{docs/validation/}。
 \end{enumerate}
 
-\subsection{项目创新点}
+\subsection{阅读指引}
 
-\begin{itemize}
-    \item 首次提出基于缓存重用距离的DAG任务调度方法
-    \item 设计了轻量化的Cache Recency Profile (CRP)预测模型
-    \item 实现了高效的在线调度算法，时间复杂度优化至$O(m^2 + m \times (m \times n))$
-    \item 提供了完整的系统实现和性能评估框架
-\end{itemize}
+第\ref{sec:realtime}节交代背景与相关工作；第\ref{sec:design}节给出架构与模块边界；第\ref{sec:theory}节给出算法与它到内核实现的映射；第\ref{sec:kernel}节讲内核实现细节与锁序；第\ref{sec:test}节给出实测协议、计数器证据与代价区间；第\ref{sec:difficulties}节记录工程问题与解决过程；第\ref{sec:conclusion}节总结并给出后续改进路线。

@@ -1,37 +1,55 @@
-% 第二章：实时系统知识
-% 负责人：马福泉
+% 第二章：背景与相关工作
 
-\section{实时系统知识} \label{sec:realtime}
+\section{背景与相关工作} \label{sec:realtime}
 
-\subsection{实时系统基础}
+\subsection{DAG 任务与多核实时调度}
 
-实时系统是指系统的正确性不仅依赖于计算结果的逻辑正确性，还依赖于产生结果的时间。根据时间约束的严格程度，实时系统可分为：
+周期任务的经典模型由 Liu 与 Layland 给出\cite{ref1}，本节沿用其实时任务与利用率的标准记号\cite{ref8}。一个周期任务 $\tau_i$ 用 $\{G_i,T_i,P_i\}$ 描述，$G_i=(V_i,E_i)$ 是 DAG，$T_i$ 是周期，$P_i$ 是优先级；节点 $u\in V_i$ 带最坏执行时间 $C_u$，边的方向给出先后约束。作业（job）指某次释放后的 DAG 实例，$u_v$ 表示节点 $u$ 的第 $v$ 次实例。
 
-\begin{itemize}
-    \item \textbf{硬实时系统}：任务必须在截止时间前完成，否则系统失效
-    \item \textbf{软实时系统}：任务偶尔超过截止时间是可以接受的
-    \item \textbf{坚实时系统}：介于硬实时和软实时之间
-\end{itemize}
+多核实时调度分两类：分区（partitioned）把任务绑定到固定核，分析与实现都简单，但负载不均时浪费算力；全局（global）允许任务迁移，用单一就绪队列做到负载均衡，代价是迁移带来的缓存失效与更复杂的分析\cite{ref2}。DAG 任务进一步引入节点级并行，调度器要么按拓扑层批量释放（list scheduling），要么按依赖驱动（dependency-driven）。本项目采用后者：依赖满足即入就绪池，选核时同时考虑缓存与负载。
 
-\subsection{多核实时调度理论}
+\subsection{缓存重用与 CRP}
 
-在多核环境下，实时调度面临以下挑战：
+现代处理器的存储层次是"私有 L1/L2 + 共享 LLC"\cite{ref5}，逐级容量与延迟差异可达一个数量级\cite{ref10}；对实时任务，抢占与迁移造成的缓存相关延迟（CRPD）甚至能占执行时间的显著比例\cite{ref3}，因此任务到核的分配本身就是一种缓存管理手段\cite{ref4}。缓存能否命中，取决于两次访问之间有多少其他数据挤进缓存。经典的栈距离/重用距离（reuse distance）用"两次访问之间访问过的不同缓存行数量"来度量\cite{ref6}。记 $u_{j,v}$ 与 $u_{j,v-1}$ 为同一节点的相邻两次实例，则第 $x$ 级缓存上的重用距离为
+\begin{equation}
+r(u_j,L_x)=\Delta \mathrm{NoUC}(u_{j,v},u_{j,v-1},L_x),
+\end{equation}
+即两次访问之间其他任务访问过的唯一缓存行数。直接统计缓存行需要硬件计数器与逐行追踪，代价高；由于指令执行量近似随时间线性增长，工程上改用时间近似
+\begin{equation}
+r(u_j,L_x)=g\big(t(u_{j,v})-t(u_{j,v-1})\big),
+\end{equation}
+其中 $g(\cdot)$ 把"这段时间里别的任务执行了多久"折算成干扰量。这一步把缓存建模降成了对执行区间的记账，是能在内核里实现的关键。
 
-\begin{enumerate}
-    \item \textbf{负载均衡}：如何在多个核心间合理分配任务
-    \item \textbf{缓存一致性}：多核间的缓存同步开销
-    \item \textbf{任务依赖}：DAG任务间的前驱后继关系
-    \item \textbf{实时性保证}：确保任务在截止时间前完成
-\end{enumerate}
+缓存重用画像（Cache Recency Profile, CRP）把重用距离映射为相对 WCET 的加速比：重用距离越小，缓存越可能仍持有该任务的数据，执行时间越短。CRP 的两个性质被后续算法直接利用：一是单调性（重用距离增大，预测时间不减），二是可用分段线性函数逼近，从而只用整数运算与查表即可在线求值。按缓存层级，CRP 通常分三段刻画：核心重用（$L_1$，私有）、集群重用（$L_2$，组内共享）、系统重用（$L_3$，全芯片共享）。
 
-\subsection{缓存层次结构}
+\subsection{AJLR：用学习到的重用画像做分配}
 
-现代多核处理器采用多级缓存架构：
+AJLR\cite{ref7}针对多核上的并行作业提出：为每个作业维护一张历史表 $H(\lambda_k)$，记录它上次在各核上的执行时间；选核时先用 CRP 预测"放到核 $\lambda_k$ 能省多少"，再用两条规则决定最终放置。
 
 \begin{itemize}
-    \item \textbf{L1缓存}：容量小、速度快、每个核心独享
-    \item \textbf{L2缓存}：容量中等、集群内核心共享
-    \item \textbf{L3缓存}：容量大、所有核心共享
+    \item \textbf{MSF（Maximum Speedup First）}：把作业放到预测加速比最高的可用核。
+    \item \textbf{LCIF（Least Cache Impact First）}：当多个核的预测加速比相同时，选"对其他作业缓存收益破坏最小"的那个，即
+    \begin{equation}
+    \mathrm{Imp}(u_j,\lambda_k)=\sum_{u_x\in H(\lambda_k)}\Big(S(u_x,\lambda_k,H,CRP)-S(u_x,\lambda_k,H',CRP)\Big),
+    \end{equation}
+    $H'$ 是加入 $u_j$ 之后的历史表。
 \end{itemize}
 
-缓存的命中率直接影响任务的执行时间，因此缓存感知调度对于提升系统性能至关重要。
+AJLR 的价值在于把"缓存收益"变成了可比较的数值，并且只依赖执行区间的记账，不依赖静态的缓存行分析。它的代价是每个决策点要遍历候选核的历史表；在核数多、唤醒频繁时，这笔开销必须显式控制，这一点在第\ref{sec:kernel}节与第\ref{sec:test}节的实测里反复出现。
+
+\subsection{Linux 调度类机制}
+
+Linux 用 \texttt{sched\_class} 把调度策略做成可插拔的一层\cite{ref9}。每个调度类实现一组回调，与本项目相关的有：
+
+\begin{itemize}
+    \item \texttt{select\_task\_rq}：唤醒/新建任务时决定放到哪个核。注意 \texttt{core.c} 的包装层在 \texttt{p->nr\_cpus\_allowed == 1} 时会直接返回该核，回调根本不会被调用——这是"亲和性一设，AJLR 就失效"的根因。
+    \item \texttt{enqueue\_task}/\texttt{dequeue\_task}：入队出队。必须同步维护 \texttt{rq->nr\_running}（\texttt{add\_nr\_running}），否则 \texttt{\_\_pick\_next\_task} 的快路径会跳过本调度类。
+    \item \texttt{balance}：负载均衡钩子，在调度点被调用，上下文持有 \texttt{rq\_lock} 且可能关中断。
+    \item \texttt{task\_dead}：任务消亡，在 \texttt{finish\_task\_switch} 内调用，用于释放与任务绑定的资源。
+\end{itemize}
+
+此外策略号需要落在 \texttt{include/uapi/linux/sched.h} 的空位，配置项进入 \texttt{init/Kconfig}，链接段进入 \texttt{include/asm-generic/vmlinux.lds.h}，缺一处就会出现"编译通过但策略不存在"或"符号重复"。
+
+\subsection{本文的定位}
+
+已发表的缓存感知分配工作大多在仿真或离线分析中验证，缺少"在真实内核里跑起来并如实报告代价"的环节；而内核社区的调度类实现又通常不做缓存建模。Yat-CAShed 把两端接起来：第\ref{sec:kernel}节给出一个可编译、可观测、可复现实验的调度类，第\ref{sec:test}节给出它的实测代价与归因。本文刻意不把仿真当作证据——项目前期的模拟器已在第\ref{sec:difficulties}节交代其口径问题与去处。

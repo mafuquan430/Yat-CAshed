@@ -1,60 +1,85 @@
-% 第三章：整体框架
-% 负责人：马福泉
+% 第三章：整体架构
 
-\section{整体框架} \label{sec:design}
+\section{整体架构} \label{sec:design}
 
-\subsection{系统架构}
+\subsection{分层与边界}
 
-Yat-CASched调度器采用分层架构设计，主要包括以下模块：
+系统分三层：算法与模型、内核实现、实测载体（\autoref{fig:arch}）。算法只在第\ref{sec:theory}节定义一次；内核按它实现，实测用 QEMU 承载真实内核。证据链有两条，且不能互相替代：静态门禁证明"能编译、链接、符号一致"，内核实测证明"调度路径确实被调用、代价多大"。
 
-\begin{itemize}
-    \item \textbf{任务管理模块}：负责DAG任务的解析、存储和管理
-    \item \textbf{缓存建模模块}：实现Cache Recency Profile (CRP)预测模型
-    \item \textbf{调度决策模块}：基于MSF和LCIF规则进行核心分配
-    \item \textbf{运行时监控模块}：跟踪任务执行状态和缓存使用情况
-    \item \textbf{性能评估模块}：收集性能指标并进行分析
-\end{itemize}
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  box/.style={draw,rounded corners=2pt,align=center,font=\small,minimum height=8mm,text width=3.6cm},
+  side/.style={draw,dashed,rounded corners=2pt,align=center,font=\small,minimum height=8mm,text width=3.2cm,text=black!55},
+  lab/.style={font=\small\bfseries,align=right},
+  arr/.style={-{Latex[length=2mm]},thick},
+  darr/.style={-{Latex[length=2mm]},thick,dashed,black!45}
+]
+\node[lab] at (-4.6,2.2) {算法/模型};
+\node[box] (model) at (-1.6,2.2) {CRP 预测 + MSF/LCIF\\（第\ref{sec:theory}节）};
+\node[lab] at (-4.6,0.6) {内核实现};
+\node[box] (sched) at (-1.6,0.6) {调度类 \texttt{yat\_casched.c}\\选核 / 就绪池 / 历史表};
+\node[box] (obs) at (2.6,0.6) {debugfs 计数器\\tracepoint};
+\node[lab] at (-4.6,-1.0) {实测载体};
+\node[box] (qemu) at (-1.6,-1.0) {QEMU + 自建 initramfs\\\texttt{yat\_bench}};
+\node[box] (gates) at (2.6,-1.0) {\texttt{make verify-all}\\静态门禁};
+\node[lab] at (-4.6,-2.6) {前期工作};
+\node[side] (sim) at (-1.6,-2.6) {Java 模拟器\\（设计期校验，不作证据）};
+\draw[arr] (model) -- (sched);
+\draw[arr] (sched) -- (obs);
+\draw[arr] (qemu) -- (sched);
+\draw[arr] (gates) -- (sched);
+\draw[darr] (model) -- (sim);
+\end{tikzpicture}
+\caption{系统分层：一份算法、一个内核实现、两条证据链（静态门禁 / 内核实测）；仿真器只作为前期工作的设计期校验}
+\label{fig:arch}
+\end{figure}
 
-\subsection{数据结构设计}
+这条边界决定了本文的证据结构：第\ref{sec:test}节只报内核实测与静态门禁，不把仿真数据当作算法有效性的证据。
 
-\subsubsection{任务表示}
+\subsection{内核侧组成}
 
-\begin{code}
-struct DAGTask {
-    int task_id;
-    vector<Node> nodes;
-    vector<Edge> edges;
-    int period;
-    int priority;
-    int total_workload;
-};
+调度类以内置方式编进内核（非模块），策略号为 8，配置项 \texttt{CONFIG\_SCHED\_CLASS\_YAT\_CASCHED}。集成点见\autoref{tab:kfiles}。
 
-struct Node {
-    int node_id;
-    int wcet;
-    vector<int> predecessors;
-    vector<int> successors;
-};
-\end{code}
+\begin{table}[H]
+\centering
+\caption{内核集成点}
+\label{tab:kfiles}
+\small
+\begin{tabular}{@{}p{5.6cm}p{8.4cm}@{}}
+\toprule
+文件 & 改动职责 \\
+\midrule
+\texttt{kernel/sched/yat\_casched.c} & 调度类全部实现：就绪池、DAG/作业、历史表、加速表、选核、计数器 \\
+\texttt{include/linux/sched/yat\_casched.h} & 数据结构与对外接口声明（29 个声明，符号检查门禁覆盖） \\
+\texttt{include/trace/events/yat\_casched.h} & 三个 tracepoint：account / place / wakeup \\
+\texttt{include/linux/sched.h} & \texttt{task\_struct} 增加 \texttt{yat\_casched} 实体 \\
+\texttt{kernel/sched/core.c} & 策略校验、\texttt{sched\_class} 注册、初始化 \\
+\texttt{kernel/sched/sched.h} & \texttt{yat\_casched\_policy()} 与 \texttt{rq} 扩展 \\
+\texttt{kernel/sched/Makefile} & 编入 \texttt{yat\_casched.o} \\
+\texttt{init/Kconfig} & 配置项与依赖 \\
+\texttt{include/uapi/linux/sched.h} & \texttt{SCHED\_YAT\_CASCHED = 8} \\
+\texttt{include/asm-generic/vmlinux.lds.h} & 链接段注册 \\
+\bottomrule
+\end{tabular}
+\end{table}
 
-\subsubsection{调度状态}
+\subsection{前期工作：仿真器}
 
-\begin{code}
-struct SchedulingState {
-    vector<Core> cores;
-    map<int, int> allocation_history;
-    SpeedupTable speedup_table;
-    CacheRecencyProfile crp_model;
-};
-\end{code}
+项目前期实现过一个 Java 17 模拟器（\texttt{simulator/}，6361 行），用同一套缓存模型比较 WFD 与缓存感知启发式，并配有 CSV 导出、$t$ 区间统计与 116 项单测。它回答的是"在理想化模型下，某条放置规则会怎么表现"，而不是"在真实内核上会怎么表现"：其执行时间与命中判定由自建的缓存模型给出，不含抢占、迁移、TLB 与真实 LLC 竞争。本轮把它从证据链中移除，正文只在第\ref{sec:test}节用一小段交代结论与去处，代码与全部数据留在仓库文档中。
 
-\subsection{接口设计}
+\subsection{复现入口}
 
-调度器提供以下主要接口：
+\begin{verbatim}
+make verify-all          # 静态门禁（含符号一致性、补丁包、文档链接）
+make report              # 编译本文
+make kernel-obj          # 只编调度器目标文件（秒级类型检查）
+make kernel-build        # 全量编译，产出 arch/x86/boot/bzImage
+scripts/run_kernel_repeats.sh --repeats 5     # 内核实测（3 组配置 x 5 次）
+cd linux-6.8-main/yat_test_scripts && ./compare_cfs_vs_yat.sh \
+   --tasks 8 --iters 2000000 --affinity none --sleep-us 200
+\end{verbatim}
 
-\begin{itemize}
-    \item \texttt{schedule\_tasks()}: 主调度函数
-    \item \texttt{update\_crp\_model()}: 更新CRP模型
-    \item \texttt{calculate\_speedup()}: 计算加速比
-    \item \texttt{allocate\_core()}: 核心分配决策
-\end{itemize}
+门禁刻意做成"快"：\texttt{make check} 查冲突标记与空文件，\texttt{make docs-check} 查 Markdown 链接，
+\texttt{make name-check} 查项目名拼写，\texttt{make symbol-check} 查头文件声明与实现定义的一致性，
+\texttt{make patch-check} 查补丁包 SHA256 与 hunk 数。这些检查都在秒级，可以在每次提交前跑完。

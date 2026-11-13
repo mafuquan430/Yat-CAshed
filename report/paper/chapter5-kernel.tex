@@ -71,7 +71,7 @@ WARNING: possible irq lock inversion dependency detected
 
 \subsection{可观测性}
 
-调度器自带 \texttt{debugfs} 接口与 per-CPU 计数器，二者分工明确：计数器是"便宜、可累加、可跨轮次对比"的量，tracepoint 是"带参数、可离线分析"的量。计数器共 28 项（\texttt{debugfs:/sys/kernel/debug/yat\_casched/stats}），关键的有：
+调度器自带 \texttt{debugfs} 接口与 per-CPU 计数器，二者分工明确：计数器是"便宜、可累加、可跨轮次对比"的量，tracepoint 是"带参数、可离线分析"的量。计数器共 31 项（\texttt{debugfs:/sys/kernel/debug/yat\_casched/stats}），关键的有：
 
 \begin{itemize}
   \item \texttt{select\_calls / select\_decided / select\_sticky\_idle / select\_nocore}：选核回调是否被调用、做出了决策、还是走了复用/失败分支；

@@ -3,6 +3,44 @@
 本项目自本文件引入之日起采用 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 风格记录变更。
 日期格式为 `YYYY-MM-DD`。
 
+## [2026-11-13] Route A：就绪代际门禁（镜像 #20）
+
+### 新增（Added，内核）
+
+- `kernel/sched/yat_casched.c`：为"作业变成就绪"引入全局代际号 `yat_ready_gen`/
+  `yat_scanned_gen`。作业创建时无前驱、或最后一个前驱完成时加一；`balance` 只在代际
+  变化时扫描就绪池，池空且代际未变时在取 `yat_balance_lock` 之前返回。
+- 新增三个计数器：`balance_noop`（空转快路径）、`pool_scans`（真实扫描）、
+  `pool_scan_skips`（代际未变而跳过）。debugfs 计数器由 28 项增至 31 项。
+- `patches/0008-sched-yat-casched-ready-generation.patch`：Route A 固化为可独立应用的补丁，
+  `series`/`MANIFEST.sha256`/`patches/README.md` 同步。
+
+### 修复（Fixed，工具链）
+
+- `patches/0005-test-env.patch` 在 `yat_affinity_test.c` 的最后一个 hunk 处被截断，
+  `git apply` 报 "corrupt patch at line 3276"；已按当前树重新生成并验证 21 个文件逐个一致。
+- `compare_cfs_vs_yat.sh` 增加 `flock` 并发锁：两个实例并行会共用 `results/` 下的
+  initramfs 与日志，表现为"未在日志中找到 YATCSV 行"的假失败（本轮实际踩到过）。
+- 计数器回显的 grep 增加 `pool_` 前缀，否则新计数器在结果里不可见。
+
+### 实测（Measured）
+
+| 配置 | 优化前 #19 | 优化后 #20 |
+|---|---|---|
+| 主口径 | 2.002 [1.612, 2.506] | **1.812** [1.756, 2.131] |
+| shared（回调不被调用） | 1.702 [1.550, 2.395] | 1.718 [1.641, 1.804] |
+| 无唤醒 | 1.105 [0.731, 1.363] | 0.838 [0.812, 1.171] |
+
+`balance_runs` 757 → 9（98.6% 的调用成为空转），选核边际代价 ≈18% → ≈5%。
+两组全距仍重叠，故 −9.5% 只作方向证据；数据见 `docs/validation/2026-11-13/kernel/repeat-routeA/`。
+
+### 变更（Changed，文档）
+
+- 论文第 6 章补一节"一次已落地的优化：就绪代际门禁"，新增 `tab:routea` 前后对比表；
+  第 8 章路线 A 标记为已落地，并新增路线 A$'$（压唤醒路径本身的锁开销）。
+- `docs/DEVELOPMENT.md` 新增第 6 节：机制、不变量表、验收读数、复算命令。
+- `scripts/check_numbers.py` 升级为双数据集校验（优化前/当前），66 项比对。
+
 ## [2026-11-13] 论文改为以内核证据为主；仿真器降级为前期工作
 
 ### 变更（Changed，论文）

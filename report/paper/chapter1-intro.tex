@@ -25,7 +25,7 @@
 \texttt{include/linux/sched/yat\_casched.h} & 266 行 & \texttt{make symbol-check} \\
 \texttt{include/trace/events/yat\_casched.h} & 228 行 & \texttt{debugfs} 寄存器组 \\
 \texttt{yat\_test\_scripts/} & 3 配置 $\times$ 5 次 & \texttt{compare\_cfs\_vs\_yat.sh} \\
-\texttt{patches/}（7 个补丁） & —— & \texttt{make patch-check} \\
+\texttt{patches/}（8 个补丁） & —— & \texttt{make patch-check} \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -37,7 +37,7 @@
 本文不是对已有结论的复述，而是把系统做完、测完并核对之后写成的工程记录。主要工作有四件：
 
 \begin{enumerate}
-    \item \textbf{实现}：在 Linux 6.8 上新增内置调度类 \texttt{SCHED\_YAT\_CASCHED}（策略号 8），完成选核、DAG/作业生命周期、每核历史表、加速表、28 项计数器与 \texttt{debugfs} 观测接口，并给出可独立应用的补丁包。
+    \item \textbf{实现}：在 Linux 6.8 上新增内置调度类 \texttt{SCHED\_YAT\_CASCHED}（策略号 8），完成选核、DAG/作业生命周期、每核历史表、加速表、31 项计数器与 \texttt{debugfs} 观测接口，并给出可独立应用的补丁包。
     \item \textbf{修复}：定位并修掉一处被 \texttt{lockdep} 实证的锁反序（\texttt{task\_dead} 在开中断上下文销毁作业，与 balance 路径构成 ABBA），重建镜像并复跑对照，同类告警计数归零。
     \item \textbf{实测}：在 QEMU（4 vCPU，TCG）上用同一份负载跑三组对照、每组重复 5 次，给出中位数与全距；用计数器证明调度类回调确实被调用、决策确实落地（接管率 $98.5\%$），并用"单核 pin"与"无唤醒"两组对照把墙钟代价定位到唤醒路径的回调，而不是 AJLR 选核本身。
     \item \textbf{可复现}：每个数字都能由仓库内脚本重算——\texttt{make verify-all} 是静态门禁，\texttt{scripts/run\_kernel\_repeats.sh} 是实测脚本，结果按配置归档在 \texttt{docs/validation/}。

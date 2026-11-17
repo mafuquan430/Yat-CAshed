@@ -68,7 +68,7 @@
    [CONFLICT_ANALYSIS.md](CONFLICT_ANALYSIS.md) §7 的版本关系结论）。
 2. **命名**（机械可判定，见 [`../CONTRIBUTING.md`](../CONTRIBUTING.md) §6）：
    - **项目名**：统一 `Yat-CAShed`。唯一例外是与外部实体绑定的不可变标识——
-     GitHub 仓库路径（`github.com/donotcryok/Yat-CAShed`）、论文标题、`report/paper/Yat-CAShed.tex`
+     GitHub 仓库路径（现 `github.com/mafuquan430/Yat-CAshed`，旧地址 `donotcryok/Yat-CAShed` 由 GitHub 重定向）、论文标题、`report/paper/Yat-CAShed.tex`
      等既有文件名，这些改动会破坏外部链接或构建，故保持原样。
    - **调度类名（散文）**：写作 `Yat-CAShed 调度类`，或直接引用注册名 `SCHED_YAT_CASCHED`。
    - **代码标识符**：一律 `yat_casched`（小写下划线）与 `YAT_CASCHED`（宏/策略名），

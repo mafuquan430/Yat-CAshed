@@ -24,7 +24,8 @@
 
 > **状态更新（A8 实跑后）**：审计时「AJLR 决策不落地（`jobs_placed` 恒 0）」这一条
 > 已关闭。实跑数据为 `ttwu_ok 512 / select_decided 254 / jobs_placed 254 /
-> place_hit 925 · miss 0 · pending 14`，接管率 98%；但墙钟仍为 CFS 的约 1.9–2.2 倍，
+> place_hit 925 · miss 0 · pending 14`，接管率 98%；但墙钟仍为 CFS 的约 1.9–2.2 倍（#19 及更早镜像的口径；
+> 路线 A 之后为 `select_calls 467 / jobs_placed 172 / place_hit 906/pending 18`，主口径 1.81），
 > 即「决策已生效、性能未站住」。详见 [`ROADMAP.md`](ROADMAP.md) §A8.1–§A8.2。
 
 ---

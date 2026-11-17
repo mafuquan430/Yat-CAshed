@@ -47,7 +47,7 @@
 ## 四、复现命令
 
 ```bash
-make verify-all                 # 7 道门禁（结构/链接/数字/命名/符号/补丁/模拟器）
+make verify-all                 # 8 道门禁（健康/结构/链接/数字/命名/符号/补丁/模拟器）
 make numbers-check              # 只跑数字重算（66 项）
 bash scripts/run_kernel_repeats.sh --repeats 5 --out /tmp/r   # 重跑 15 次实测
 bash linux-6.8-main/yat_test_scripts/compare_cfs_vs_yat.sh --tasks 8 --iters 2000000 \

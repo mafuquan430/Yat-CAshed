@@ -260,7 +260,7 @@ Linux / macOS / WSL / Git-Bash 均可直接使用；Windows 亦可用 [`build.ba
 | 问题 | 说明 |
 |------|------|
 | ~~AJLR 就绪池未接入主调度路径~~ | ✅ **已关闭（P13）**。原状：`yat_ajlr_enqueue_task()` 只把 `yat_job` 绑定到 `task_struct`、不插入 `global_ready_pool`，而 `pick_next_task_yat_casched()` 从 `rq->yat_casched.tasks` 选任务，于是 `jobs_placed` / `history_records` / `accel_inserts` 常为 0。现由 `select_task_rq` 承担「全局放置」职责；就绪池仍只服务显式 DAG 路径，这是**有意的分工**——隐式任务作业不应被本地队列与全局池重复决策（见 `yat_update_ready_pool()` 的跳过条件）。 |
-| ~~AJLR 接管率尚未实测~~ | ✅ **已关闭（A8.1）**。实跑数据：`ttwu_ok 512 / select_decided 254 / jobs_placed 254 / place_hit 925 · miss 0 · pending 14` → 接管率 **98%**。同时必须坚持的限定：`placements` 是实时快照（任务退出即空），可留存证据是 `place_hit/miss/pending` 累计值；CFS-vs-Yat 的墙钟差异仍**不能**当作 AJLR 的收益（当前实现反而慢约 1.9–2.2×，见 [ROADMAP.md](ROADMAP.md) §A8.1–A8.2）。 |
+| ~~AJLR 接管率尚未实测~~ | ✅ **已关闭（A8.1）**。实跑数据（#19 及更早）：`ttwu_ok 512 / select_decided 254 / jobs_placed 254 / place_hit 925 · miss 0 · pending 14` → 接管率 **98%**；路线 A 之后（#20）为 `select_calls 467 / select_decided 172 / place_hit 906 · pending 18` → **98.1%**。同时必须坚持的限定：`placements` 是实时快照（任务退出即空），可留存证据是 `place_hit/miss/pending` 累计值；CFS-vs-Yat 的墙钟差异仍**不能**当作 AJLR 的收益（当前实现反而慢约 1.9–2.2×，见 [ROADMAP.md](ROADMAP.md) §A8.1–A8.2）。 |
 | 决策节流常数未标定 | `YAT_DECISION_MIN_INTERVAL_NS = 1 ms` 是经验值；最优值依赖 D1' 的真实硬件代价模型。 |
 
 ### 5.2 已收敛的 P1 文档治理项（本轮关闭）

@@ -1,6 +1,6 @@
 # Yat-CAShed
 
-[![CI](https://github.com/mafuquan/Yat-CAShed/actions/workflows/ci.yml/badge.svg)](https://github.com/mafuquan/Yat-CAShed/actions/workflows/ci.yml)
+[![CI](https://github.com/mafuquan430/Yat-CAshed/actions/workflows/ci.yml/badge.svg)](https://github.com/mafuquan430/Yat-CAshed/actions/workflows/ci.yml)
 [![License: GPL-2.0](https://img.shields.io/badge/kernel-GPL--2.0-blue.svg)](linux-6.8-main/COPYING)
 [![Java](https://img.shields.io/badge/simulator-JDK%2017%2B-orange.svg)](simulator)
 [![Kernel](https://img.shields.io/badge/kernel-Linux%206.8-informational.svg)](linux-6.8-main)

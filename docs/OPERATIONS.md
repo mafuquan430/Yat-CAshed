@@ -71,20 +71,27 @@ cd linux-6.8-main/yat_test_scripts
 
 脚本会在结束时自动打印这段判定，看到 ✅ 才说明这组数据可以评价 AJLR。
 
-### 3.3 期望输出（实测基线，kernel #14，smp=4）
+### 3.3 期望输出（当前镜像 #20，smp=4，路线 A 之后）
 
 ```
 ttwu_ok            512        # = 8 任务 × 64 次 sleep，与负载完全吻合
-select_calls       459
-select_decided     254
-jobs_placed        254
-place_hit          925
+select_calls       467        # 91.2% 的唤醒进入调度类回调（其余走 wakelist 快路径）
+select_sticky_idle 295        # 其中 63.2% 由"目标核空闲"直接复用
+select_decided     172        # 完整跑完 AJLR 决策的次数
+jobs_placed        172        # 决策落地次数
+place_hit          906
 place_miss         0
-place_pending      14
-pick_null_desync   0
+place_pending      18
+balance_runs         9        # 优化前 757；现只在就绪代际变化时扫描
+balance_noop       621        # 池空且代际未变，不取锁直接返回
+pick_null_desync     0
 ```
 
-接管率由脚本算出：`925 / (925+0+14) ≈ 98%`。
+接管率由脚本算出：`906 / (906+0+18) ≈ 98.1%`。
+
+> 早于 #20 的镜像（如 #14、#19）读数不同：`select_calls` 约 459、`select_decided` 与
+> `jobs_placed` 为 254、`place_hit 925 / pending 14`、`balance_runs 757`。
+> 这些差异来自就绪代际门禁（补丁 `0008`），不是负载变了。
 
 ---
 

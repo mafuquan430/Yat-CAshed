@@ -12,7 +12,7 @@
 | 可重建性 | 8 个可独立应用的补丁 + SHA256 清单 | 按序应用后与工作树逐字节一致 | `patches/`、`make patch-check` |
 | 实测 | 3 配置 × 5 次 × 2 个镜像 | 主口径 1.812（#20）/ 2.002（#19） | `docs/validation/2026-11-13/kernel/` |
 | 闭环优化 | 就绪代际门禁（Route A） | `balance_runs` 757 → 9，621 次空转快路径 | `patches/0008-*.patch` |
-| 论文 | 设计开发文档（LaTeX → PDF） | 24 页，0 error，2 处 overfull（< 5 pt） | `report/paper/Yat-CAShed.pdf` |
+| 论文 | 设计开发文档（LaTeX → PDF） | 25 页，0 error，2 处 overfull（< 5 pt） | `report/paper/Yat-CAShed.pdf` |
 | 软著材料 | 申请表稿 + 60 页源码 + 21 页说明书 | 功能描述 1244 字符，页眉页脚齐全 | `soft-copyright/` |
 | 门禁 | 7 道静态/一致性检查 | 数字 66 项、链接 363 条、符号 29 个、补丁 8 个 | `make verify-all` |
 

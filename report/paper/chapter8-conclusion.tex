@@ -4,7 +4,7 @@
 
 \subsection{结论}
 
-\paragraph{实现了什么。}一个内置于 Linux 6.8 的调度类：策略号 8，2752 行 C，29 个对外声明、3 个 tracepoint、31 项 \texttt{debugfs} 计数器，固化成 8 个可独立应用的补丁。它不是原型片段——能编进 \texttt{bzImage}、能在 QEMU 里起来、能让任务真正在这个策略下跑完并交回正确计数；按序应用补丁后与工作树逐字节一致，15 次测量共 30 次独立启动，没有出现 \texttt{lockdep} 告警或 BUG。
+\paragraph{实现了什么。}一个内置于 Linux 6.8 的调度类：策略号 8，2830 行 C，29 个对外声明、3 个 tracepoint、31 项 \texttt{debugfs} 计数器，固化成 8 个可独立应用的补丁。它不是原型片段——能编进 \texttt{bzImage}、能在 QEMU 里起来、能让任务真正在这个策略下跑完并交回正确计数；按序应用补丁后与工作树逐字节一致，15 次测量共 30 次独立启动，没有出现 \texttt{lockdep} 告警或 BUG。
 
 \paragraph{在工作，且没有空转。}512 次唤醒触发 467 次选核（其余走 wakelist 快路径），295 次由"目标核还空着"直接复用（63.2\%），172 次完整决策全部落地，接管率 $98.1\%$、\texttt{place\_miss}=0、\texttt{pick\_null\_desync}=0。这组读数同时排除两类常见错误：回调被亲和性锁死（\texttt{shared} 配置下 \texttt{select\_calls}=0 就是反面证据），以及"算出来但没落地"。63.2\% 的复用率还说明局部性不是靠反复迁移换来的——多数唤醒的核没有变。
 

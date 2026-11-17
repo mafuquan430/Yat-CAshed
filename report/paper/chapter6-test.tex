@@ -113,6 +113,14 @@ none + 无唤醒 & 0.84 & 0.81 & 1.17 & 无唤醒路径 \\
   \item \textbf{没有唤醒时，差异落在噪声里}（0.84，全距 $[0.81,1.17]$ 跨 1）。此时只剩 \texttt{WF\_FORK}，唤醒相关的回调不发生；这一格说明基础调度机制（时间片、pick、上下文切换）不构成这笔开销，代价确实随唤醒次数增长。
 \end{enumerate}
 
+见\autoref{fig:cost}。
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.82\textwidth]{img/fig-three-configs.png}
+\caption{三组配置的墙钟比值：柱为 5 次中位数，须为全距；虚线为 CFS 基线}
+\label{fig:cost}
+\end{figure}
+
 把三格相减，代价的归属是明确的：$\rho_{\text{主}}/\rho_{\text{shared}}=1.81/1.72\approx1.05$，即\textbf{把 AJLR 的全部选核工作拿掉只能省 5\%}；而只要任务在这个调度类里被唤醒，就要付 1.72 倍的账。优化的顺序因此不需要猜：先动接入路径，再谈算法。
 
 这一结论的价值在于它可执行：1.72 不是一个"调度器整体慢"的笼统判断，而是指向 \texttt{enqueue\_task}（取 \texttt{rq\_lock}）、\texttt{select\_task\_rq}（读四张历史表）与每个调度点的 \texttt{put\_prev\_task} 记账。第\ref{sec:conclusion}节的路线 A$'$ 就是照着这个指向列的。
@@ -155,6 +163,13 @@ none + 无唤醒 & 0.84 & 0.81 & 1.17 & 无唤醒路径 \\
   \item \textbf{副作用是正向的}：\texttt{jobs\_placed} 从 271 降到 172 不是退步。旧实现每轮都把已经在睡眠的任务重新"放置"一遍，这些放置不产生任何效果，只是把计数器撑大；新实现只放置真正需要放置的作业，接管率反而从 97.9\% 升到 98.1\%。
   \item \textbf{归因被反过来验证了}：优化只作用于 balance 路径，主口径降 9.5\%、\texttt{shared} 几乎不动（$1.70\to1.72$）、无唤醒仍在噪声内（$1.10\to0.84$，跨 1），三者与"代价主要在唤醒路径"的判断一致。
 \end{itemize}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.86\textwidth]{img/fig-balance.png}
+\caption{balance 调用结构：优化前 757 次全量扫描全部取锁；优化后 9 次扫描 + 621 次不取锁的空转快路径}
+\label{fig:balance}
+\end{figure}
 
 \subsection{前期工作：仿真器}
 

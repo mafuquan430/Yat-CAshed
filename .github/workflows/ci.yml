@@ -19,8 +19,19 @@ jobs:
         run: bash scripts/check_repo.sh
         continue-on-error: false
 
+      # 结构守卫守的是"文档与目录的组织"：顶层布局、入口文件、docs 索引完整性、
+      # 是否误提交构建产物、软著交付件是否齐全。它上线当天就抓出过 4 处漏登记。
+      - name: 仓库结构守卫
+        run: python3 scripts/check_structure.py
+        continue-on-error: false
+
       - name: Markdown 相对链接检查
         run: python3 scripts/check_docs.py
+        continue-on-error: false
+
+      # 论文 / README / 说明书里的数字全部由归档 CSV 重算；抄错一个数就失败。
+      - name: 数字一致性检查
+        run: python3 scripts/check_numbers.py
         continue-on-error: false
 
       - name: 内核头文件/实现符号一致性检查

@@ -51,6 +51,8 @@ Yat-CAShed 基于 AJLR（Allocation of parallel Jobs based on Learned cache Rece
 | [`docs/ROADMAP.md`](docs/ROADMAP.md) | 任务化改进清单（P0–P3） |
 | [`docs/EXPERIMENT_REPORT.md`](docs/EXPERIMENT_REPORT.md) | 模拟器实验报告（指标 / 统计 / 复现） |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | 贡献规范（分支 / 提交 / 代码风格） |
+| [`soft-copyright/README.md`](soft-copyright/README.md) | 软件著作权登记材料包（申请表稿 / 60 页源程序 / 21 页说明书 / 填报指引） |
+| [`report/submission/`](report/submission) | 大创结题填报材料（项目执行情况 + 研究总结报告） |
 
 > ✅ **状态**：`kernel/sched/yat_casched.c` 的 **10 处 Git 合并冲突已按「路线 A（决赛 AJLR 版）」全部解决**，
 > 当前文件无冲突标记、符号一致性检查通过。决策依据与执行明细见 [`docs/CONFLICT_ANALYSIS.md`](docs/CONFLICT_ANALYSIS.md) §7–§8。
@@ -84,10 +86,11 @@ Yat-CAShed/
 │   ├── Simulator.md                          # 模拟器详细文档
 │   ├── AlgorithmComparisonExperiment.java    # 实验入口
 │   ├── allocation/                           # WFD / CacheAware 算法实现
-│   ├── tests/                                # 单元测试（102 断言）
+│   ├── tests/                                # 单元测试（116 断言）
 │   └── lib/                                  # commons-math3（唯一运行时依赖）
 └── report/                      # 论文、报告与参考资料
     ├── paper/                    # 毕业论文 LaTeX 源码（章节文件平铺）
+    ├── submission/               # 大创结题填报稿（执行情况 + 研究总结，md + docx）
     ├── prompt_md/                # 分析笔记与计划
     └── *.pdf / *.pptx            # 参考论文与早期材料
 ```
@@ -136,10 +139,11 @@ Yat-CAShed/
 其中 295 次由"目标核空闲"直接复用，172 次完整决策全部落地，接管率
 `906/924 = 98.1%`，平均可运行核数 4.0，`pick_null_desync = 0`。
 
-**代价的归属**：pin 到单核（`select_calls = 0`，AJLR 一次都不跑）仍慢 1.70×，
-说明主体代价来自“唤醒时进入这个调度类”，选核只占边际（2.00/1.70 ≈ 1.18）；
-没有唤醒时两者没有可分辨差异（1.10，全距 [0.73, 1.36] 跨 1）；
-`balance_runs = 757` 而唤醒只有 512 次，说明几乎每个调度点都在重扫就绪池。
+**代价的归属**：pin 到单核（`select_calls = 0`，AJLR 一次都不跑）仍慢 1.72×，
+说明主体代价来自“唤醒时进入这个调度类”；选核的边际从优化前的约 18%（2.00/1.70）
+压到约 5%（1.81/1.72）。没有唤醒时两者无可分辨差异（0.84，全距 [0.81, 1.17] 跨 1）。
+优化前 `balance_runs = 757` 而唤醒只有 512 次——几乎每个调度点都在重扫就绪池，
+这正是路线 A 的切入点。
 
 ```bash
 # 重跑全部 15 次测量（3 配置 × 5 次，约 30 分钟）
@@ -196,9 +200,9 @@ linux-6.8-main/yat_test_scripts/compare_cfs_vs_yat.sh \
     --tasks 8 --iters 2000000 --affinity none --sleep-us 200 --timeout 300
 ```
 
-实测基线（8 任务 / 4 核 / 2M 迭代 / 200µs 唤醒）：`ttwu_ok 512`、
-`select_decided 254`、`jobs_placed 254`、`place_hit 925 / miss 0 / pending 14`
-→ **接管率 98%**；但墙钟约为 CFS 的 **1.9–2.2 倍**，即「AJLR 已生效、性能尚未站住」。
+实测基线（8 任务 / 4 核 / 2M 迭代 / 200 µs 唤醒，路线 A 之后）：`ttwu_ok 512`、
+`select_calls 467`、`select_decided 172`、`jobs_placed 172`、`place_hit 906 / miss 0 / pending 18`
+→ **接管率 98.1%**；主口径墙钟比中位数 **1.81**（全距 [1.76, 2.13]）。
 
 完整的命令清单、计数器读法与故障排查见
 [`docs/OPERATIONS.md`](docs/OPERATIONS.md)；测试脚本参数见
@@ -210,7 +214,7 @@ linux-6.8-main/yat_test_scripts/compare_cfs_vs_yat.sh \
 ```bash
 make check          # 冲突标记 / 空文件 / 关键文件
 make docs-check     # Markdown 相对链接有效性
-make numbers-check  # 论文/README 的数字 vs 归档 CSV 与计数器（53 项比对）
+make numbers-check  # 论文/README 的数字 vs 归档 CSV 与计数器（66 项比对）
 make symbol-check   # 内核头文件声明 vs 实现定义
 make verify-all     # 以上 + 结构守卫 + 模拟器全套验证（CI 等价，共 8 道门禁）
 ```

@@ -85,7 +85,7 @@ Yat-CAShed/
 │   ├── tests/        YatSimulatorTest.java（102 条断言）
 │   └── lib/          commons-math3-3.6.1.jar（唯一运行时依赖）
 │
-└── report/                      # 论文、报告与参考资料
+├── report/                      # 论文、报告与参考资料
     ├── paper/                   # 毕业设计 LaTeX 源码（章节文件与主文件平铺）
     │   ├── Yat-CAShed.tex       # 主文件（\input 扁平文件名）
     │   ├── cover.tex / abstract.tex / navigation.tex / references.tex
@@ -95,6 +95,8 @@ Yat-CAShed/
     │   └── img/SYSULogo.png
     ├── prompt_md/               # 分析笔记（ajlr_paper_analysis / plan / test1）
     └── *.pdf / *.pptx / *.docx / *.txt   # 参考论文与早期材料
+├── patches/                     # 8 个补丁 + series + MANIFEST.sha256（可重建内核侧改动）
+└── soft-copyright/              # 软著材料包（01 申请表 / 02 源程序 / 03 说明书 / 04 签章 / 05 核验）
 ```
 
 ## 说明
@@ -108,5 +110,8 @@ Yat-CAShed/
   [`ARCHITECTURE.md`](ARCHITECTURE.md)。
 - `simulator/result/` 为运行产物目录（CSV + PNG），已被 `.gitignore` 忽略。
 - `.gitignore` 中 `*.jar` 规则通过 `!simulator/lib/*.jar` 保留唯一依赖包。
+- `soft-copyright/` 是**交付件目录**，不是运行时代码：里面的 PDF 由各自的脚本生成
+  （`02-源程序/gen_source_pdf.py`、`03-说明书/make_figures.py` + `latexmk`），
+  修改后重跑脚本即可复现；提交状态见 [`../soft-copyright/TODO.md`](../soft-copyright/TODO.md)。
 - 内核树占仓库体积绝大部分；如需瘦身，参见
   [`ROADMAP.md`](ROADMAP.md) 中「补丁化 / submodule」方向。

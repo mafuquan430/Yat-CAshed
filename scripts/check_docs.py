@@ -38,6 +38,7 @@ EXPLICIT_GLOBS = [
     "linux-6.8-main/boot_test_scripts/*.md",
     "linux-6.8-main/yat_test_scripts/*.md",
     "linux-6.8-main/test_visualization/*.md",
+    "soft-copyright/**/*.md",   # 软著材料包：说明书/申请表稿里的相互引用同样要能点开
 ]
 
 # 生成物/依赖目录，直接跳过

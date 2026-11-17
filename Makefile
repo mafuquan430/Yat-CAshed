@@ -11,7 +11,7 @@ REPORT_DIR := report/paper
 
 .DEFAULT_GOAL := help
 
-.PHONY: help check docs-check numbers-check name-check verify-all simulator simulator-compile simulator-quick simulator-verify simulator-test symbol-check visualize report clean tree homepage patch-check patch-apply patch-reverse patch-status patch-selftest kernel-setup kernel-obj kernel-build kernel-bench kernel-compare
+.PHONY: help check docs-check numbers-check name-check verify-all simulator simulator-compile simulator-quick simulator-verify simulator-test symbol-check visualize report clean tree homepage structure-check patch-check patch-apply patch-reverse patch-status patch-selftest kernel-setup kernel-obj kernel-build kernel-bench kernel-compare
 
 help:
 	@echo "=========================================="
@@ -21,6 +21,7 @@ help:
 	@echo "  make docs-check        Markdown 相对链接检查（失效链接即失败）"
 	@echo "  make numbers-check     论文/README 数字与归档数据一致性（不一致即失败）"
 	@echo "  make name-check        项目名拼写一致性检查（规范名 Yat-CAShed）"
+	@echo "  make structure-check   目录布局 / 文档索引 / 构建产物 / 软著交付件守卫"
 	@echo "  make symbol-check      内核头文件/实现符号一致性检查（静态）"
 	@echo "  make verify-all        check + docs-check + name-check + symbol-check + 补丁自检 + 模拟器全套验证"
 	@echo ""
@@ -67,12 +68,16 @@ numbers-check:
 name-check:
 	@python3 scripts/check_names.py
 
+# 仓库结构守卫：顶层布局、文档索引完整性、构建产物、软著交付件
+structure-check:
+	@python3 scripts/check_structure.py
+
 # 内核头文件声明 vs 实现 符号一致性检查（静态，不修改源码）
 symbol-check:
 	@bash scripts/check_symbols.sh
 
 # 一键全量门禁（CI 等价的最小集合）
-verify-all: check docs-check numbers-check name-check symbol-check patch-check simulator-verify
+verify-all: check structure-check docs-check numbers-check name-check symbol-check patch-check simulator-verify
 	@echo ">>> 全部门禁通过"
 
 # ---- 内核补丁包（替代 1.6GB 内核整树入库）----

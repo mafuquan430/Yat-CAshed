@@ -3,6 +3,47 @@
 本项目自本文件引入之日起采用 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 风格记录变更。
 日期格式为 `YYYY-MM-DD`。
 
+## [2026-11-17] 工程化加固：结构守卫 + 软著提交指引
+
+本轮不加新机制，只把"目录与文档的组织"也纳入可执行检查，并把软著提交过程写成逐步指引。
+
+### 门禁：第 8 道，守结构而不是守代码
+
+新增 `scripts/check_structure.py`（`make structure-check`，已并入 `verify-all`）：
+
+- 顶层布局白名单：只允许 `docs/ patches/ report/ scripts/ simulator/ soft-copyright/ linux-6.8-main/` 与约定的根文件；
+- 入口文件存在且非空（README / Makefile / patches/series / 软著交付件等）；
+- 每个顶层目录必须被 README 提到（否则等于"没写进文档"）；
+- `docs/` 下每篇 Markdown 必须被索引链接（杜绝"写了没人找得到"）；
+- 不得跟踪构建产物（`*.o` / `*.pyc` / `*~` …）；
+- 软著三份交付件齐全。
+
+上线当天即发现 4 处真实问题：`.editorconfig` 未登记、README 漏写 `patches/` 与
+`soft-copyright/`、`docs/` 索引缺项；全部修复。
+
+### 文档链接检查扩到材料包
+
+`check_docs.py` 的扫描范围新增 `soft-copyright/**/*.md`，链接数 363 → 370，
+并当场抓出 `soft-copyright/TODO.md` 里一条写错的相对路径。
+
+### 结题材料
+
+- `docs/COMPLETION_TASKS.md` 重写：旧版还写着"106 项断言 / 15 页论文 / 墙钟比 2.666"，
+  与现状完全不符；新版按交付物、验收状态、复现命令、未完成事项四块重述，全部数字可复算。
+- `README.md` 新增"本项目的四点不同"表（真内核落点 / 代价可分解 / 结论可证伪 / 数字不可分叉）。
+- 论文 §1.4 补"三句创新"：方法（消融分离成本）、验收（确定性计数器）、交付（数字门禁）。
+  PDF 仍 24 页，0 error。
+
+### 软著
+
+- 新增 `soft-copyright/06-提交指引/官网填报步骤.md`：从登录到提交的逐步操作，
+  含字段速查表、按钮识别法、6 类常见卡点处置。
+- `soft-copyright/README.md` 与 `TODO.md` 补入口链接。
+
+### 门禁现状
+
+`make verify-all` 8 道：check / structure-check / docs-check / numbers-check / name-check /
+symbol-check / patch-check / simulator-verify —— 全绿。
 ## [2026-11-13] 论文与开发文档改写：把优势写成可核对的断言
 
 本次不改代码、不改数据，只改叙述结构与落点。

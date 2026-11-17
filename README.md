@@ -17,6 +17,15 @@ Yat-CAShed 基于 AJLR（Allocation of parallel Jobs based on Learned cache Rece
 - **核心算法**：基于 Cache Recency Profile（CRP）预测执行时间，结合 LCIF/MSF 策略做出（作业，核心）分配决策
 - **工程实用性**：完整集成到 Linux 6.8 调度框架，可在 QEMU 中启动验证
 
+### 本项目的四点不同
+
+| 不同点 | 具体做法 | 为什么别人做不到/不常做 |
+|---|---|---|
+| 落在真内核，不是模拟器 | 实现为 `sched_class`（策略号 8），回调时机、锁上下文、亲和性语义全部由内核决定 | 仿真里"算法便宜"的结论，在真内核里会被接入成本吞掉；本文把两者分开报 |
+| 代价可分解 | 三组配置消融（完整链路 / 回调不进 / 无唤醒），两两相减得到选核边际代价 ≈ 5% | 只报一个总比值的工作，无法回答"该优化哪里" |
+| 结论可证伪 | 31 项 debugfs 计数器 + 3 个 tracepoint，每条断言都有对应读数与反例信号 | 计数器的确定性使"改完立刻判对错"成为可能，不必等统计显著 |
+| 数字不可分叉 | 论文/README/说明书的数字由脚本从归档 CSV 重算，66 项比对失败即阻断 | 文档与数据的漂移是这类项目最常见的隐性错误 |
+
 ## 项目主页
 
 - 🌐 **在线主页**：<https://donotcryok.github.io/Yat-CAShed/>（源码见 [`docs/index.html`](docs/index.html)）
@@ -56,6 +65,8 @@ Yat-CAShed/
 ├── Makefile                     # 顶层编排（check / docs-check / simulator / report）
 ├── .editorconfig / .gitattributes / .gitignore
 ├── docs/                        # 工程化文档体系（入口见 docs/README.md）
+├── patches/                     # 8 个可独立应用的内核补丁（替代内核整树入库）
+├── soft-copyright/              # 软著登记材料包（申请表稿 / 60 页源码 / 21 页说明书）
 ├── scripts/                     # 仓库运维脚本
 │   ├── check_repo.sh / check_symbols.sh / check_docs.py / check_names.py   # 门禁
 │   ├── kernel-patch.sh / gen_kernel_patches.sh                            # 补丁应用/生成
@@ -201,7 +212,7 @@ make check          # 冲突标记 / 空文件 / 关键文件
 make docs-check     # Markdown 相对链接有效性
 make numbers-check  # 论文/README 的数字 vs 归档 CSV 与计数器（53 项比对）
 make symbol-check   # 内核头文件声明 vs 实现定义
-make verify-all     # 以上 + 模拟器全套验证（CI 等价）
+make verify-all     # 以上 + 结构守卫 + 模拟器全套验证（CI 等价，共 8 道门禁）
 ```
 
 - [`scripts/check_repo.sh`](scripts/check_repo.sh)：冲突标记、空文件、关键文件守卫

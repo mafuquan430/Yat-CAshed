@@ -96,6 +96,10 @@ EXEMPT_SUFFIXES_UNDER = (
     ("docs/validation/", ".patch"),
     ("docs/validation/", ".csv"),
     ("docs/validation/", ".log"),
+    # 软著源程序鉴别材料是逐字拼接的源码（含 check_names.py 自身的豁免字符串），
+    # 属于"代码字面量"而非散文，不参与项目名统一改写
+    ("soft-copyright/02-源程序/", ".tex"),
+    ("soft-copyright/02-源程序/", ".py"),
 )
 
 # `linux-6.8-main/` 下只查我们自己新增的东西（其余是上游源码）

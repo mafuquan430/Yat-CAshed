@@ -31,6 +31,8 @@
 | [../CHANGELOG.md](../CHANGELOG.md) | 版本与变更记录 |
 | [../CONTRIBUTING.md](../CONTRIBUTING.md) | 贡献规范（分支 / 提交 / 风格） |
 | [../LICENSE](../LICENSE) | 分模块许可证说明 |
+| [../soft-copyright/README.md](../soft-copyright/README.md) | 软著登记材料包总览（交付件清单与复现命令） |
+| [../soft-copyright/TODO.md](../soft-copyright/TODO.md) | 软著提交待办（按天排好的时间线与人工步骤） |
 
 ## 模块内既有文档
 

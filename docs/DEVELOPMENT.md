@@ -156,20 +156,29 @@ latexmk -xelatex Yat-CAShed.tex   # 推荐：自动多遍 + 交叉引用
 
 `.github/workflows/ci.yml` 会在 push / PR 时执行：
 
-1. **仓库健康检查**：`bash scripts/check_repo.sh`（冲突标记、空文件、结构）。
-2. **文档链接检查**：`python3 scripts/check_docs.py`（Markdown 相对链接必须可解析）。
-3. **符号一致性检查**：`bash scripts/check_symbols.sh`（头文件声明 vs 实现定义、链接属性一致性）。
-4. **冲突标记独立复核**：扫描 `<<<<<<<` / `>>>>>>>`（**无白名单**，任何冲突一律阻断）。
-5. **模拟器构建与回放**：`make -C simulator compile` → `lib-test` → `test` → `run-quick`。
+1. **仓库健康检查**：`bash scripts/check_repo.sh`（冲突标记、空文件、关键文件）。
+2. **结构守卫**：`python3 scripts/check_structure.py`（顶层布局白名单、入口文件、每个顶层目录
+   必须写进 README、`docs/` 下每篇 Markdown 必须被索引、不得跟踪构建产物、软著交付件齐全）。
+3. **文档链接检查**：`python3 scripts/check_docs.py`（Markdown 相对链接必须可解析，
+   含 `soft-copyright/` 下的材料）。
+4. **数字重算**：`python3 scripts/check_numbers.py`（66 项，从归档 CSV 重算）。
+5. **项目名一致性**：`python3 scripts/check_names.py`（散文层规范名 `Yat-CAShed`）。
+6. **符号一致性检查**：`bash scripts/check_symbols.sh`（头文件声明 vs 实现定义、链接属性一致性）。
+7. **补丁包校验**：`bash scripts/kernel-patch.sh --check`（SHA256 + hunk 数）。
+8. **模拟器构建与回放**：`make -C simulator compile` → `lib-test` → `test` → `run-quick`。
 
 本地等价命令：
 
 ```bash
 make check                     # 或 bash scripts/check_repo.sh
+make structure-check           # 或 python3 scripts/check_structure.py
 make docs-check                # 或 python3 scripts/check_docs.py
+make numbers-check             # 或 python3 scripts/check_numbers.py
+make name-check                # 或 python3 scripts/check_names.py
 make symbol-check              # 或 bash scripts/check_symbols.sh
+make patch-check               # 或 bash scripts/kernel-patch.sh --check
 make simulator-verify
-make verify-all                # 以上全部串行执行
+make verify-all                # 以上全部串行执行（8 道门禁）
 ```
 
 > 合并冲突已全部解决，接口声明与实现一致，无白名单例外。
@@ -258,7 +267,7 @@ diff -u docs/validation/2026-11-13/kernel/repeat/SUMMARY.txt \
 | 可观测、且断言可证伪 | 31 个 debugfs 计数器 + 3 个 tracepoint；头文件 29 个声明全部有定义 | `make symbol-check` |
 | 实验设计能分离因果 | 三配置消融：1.81 / 1.72 / 0.84（`shared` 下 `select_calls=0`） | `bash scripts/run_kernel_repeats.sh --repeats 5 --out /tmp/r` |
 | 结论可复算 | 66 项数字由归档 CSV 重算，抄错即失败 | `make numbers-check` |
-| 文档不漂移 | 链接、项目名、数字、补丁四道门禁 | `make verify-all` |
+| 文档不漂移 | 结构、链接、数字、项目名、符号、补丁六道门禁 | `make verify-all` |
 
 ### 7.1 为什么这套读数能"分离因果"
 

@@ -74,7 +74,8 @@ make patch-selftest UPSTREAM=/tmp/up
 全量门禁（提交 PR 前推荐）：
 
 ```bash
-make verify-all   # check + docs-check + name-check + symbol-check + patch-check + simulator-verify
+make verify-all   # check + structure-check + docs-check + numbers-check + name-check
+                  # + symbol-check + patch-check + simulator-verify
 ```
 
 要验证调度行为（而不只是编译通过），跑一次 A8 冒烟：

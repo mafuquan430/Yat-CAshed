@@ -34,9 +34,11 @@ fi
 # 2) 空源文件检查（仅项目自身范围）
 echo
 echo "[2/3] 检查空源文件..."
+# docs/.nojekyll 是 GitHub Pages 的开关文件，按设计就是空的，豁免
 EMPTY=$(find . -type f -empty \
     -not -path './.git/*' \
     -not -path './linux-6.8-main/*' \
+    -not -path './docs/.nojekyll' \
     2>/dev/null || true)
 if [ -n "$EMPTY" ]; then
     echo "  ⚠️  发现空文件："

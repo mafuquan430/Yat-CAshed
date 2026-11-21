@@ -83,6 +83,7 @@
 - [2026-10-24 修补与论文证据审计](REPAIR_REVIEW_2026-10-24.md)：本轮修复、测试结果及待验收事项。
 
 - [完善任务验收](COMPLETION_TASKS.md)
+- [结题材料清单](结题材料清单.md)
 - [五种子复核结果](validation/2026-10-24/SUMMARY.md)
 
 - [实验导出可靠性验收](EXPORT_RELIABILITY_2026-10-28.md)

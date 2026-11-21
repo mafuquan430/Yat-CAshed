@@ -114,3 +114,6 @@ report/**/*.out
 .vscode/
 .idea/
 *.code-workspace
+
+# 结题材料打包产物（由 make package 生成，可随时重建）
+report/submission/dist/

@@ -53,6 +53,8 @@ Yat-CAShed 基于 AJLR（Allocation of parallel Jobs based on Learned cache Rece
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | 贡献规范（分支 / 提交 / 代码风格） |
 | [`soft-copyright/README.md`](soft-copyright/README.md) | 软件著作权登记材料包（申请表稿 / 60 页源程序 / 21 页说明书 / 填报指引） |
 | [`report/submission/`](report/submission) | 大创结题填报材料（项目执行情况 + 研究总结报告） |
+| [`report/slides/`](report/slides) | 结题答辩 PPT 与讲稿（含 10 个可能追问及答法） |
+| [`docs/结题材料清单.md`](docs/结题材料清单.md) | 结题材料逐项核对表（交什么 / 在哪 / 什么状态） |
 
 > ✅ **状态**：`kernel/sched/yat_casched.c` 的 **10 处 Git 合并冲突已按「路线 A（决赛 AJLR 版）」全部解决**，
 > 当前文件无冲突标记、符号一致性检查通过。决策依据与执行明细见 [`docs/CONFLICT_ANALYSIS.md`](docs/CONFLICT_ANALYSIS.md) §7–§8。
@@ -91,6 +93,7 @@ Yat-CAShed/
 └── report/                      # 论文、报告与参考资料
     ├── paper/                    # 毕业论文 LaTeX 源码（章节文件平铺）
     ├── submission/               # 大创结题填报稿（执行情况 + 研究总结，md + docx）
+    ├── slides/                   # 结题答辩 PPT 与讲稿
     ├── prompt_md/                # 分析笔记与计划
     └── *.pdf / *.pptx            # 参考论文与早期材料
 ```

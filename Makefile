@@ -11,7 +11,7 @@ REPORT_DIR := report/paper
 
 .DEFAULT_GOAL := help
 
-.PHONY: help check docs-check numbers-check name-check verify-all simulator simulator-compile simulator-quick simulator-verify simulator-test symbol-check visualize report clean tree homepage structure-check patch-check patch-apply patch-reverse patch-status patch-selftest kernel-setup kernel-obj kernel-build kernel-bench kernel-compare
+.PHONY: help check docs-check numbers-check name-check verify-all simulator simulator-compile simulator-quick simulator-verify simulator-test symbol-check visualize report clean tree homepage structure-check package patch-check patch-apply patch-reverse patch-status patch-selftest kernel-setup kernel-obj kernel-build kernel-bench kernel-compare
 
 help:
 	@echo "=========================================="
@@ -22,6 +22,7 @@ help:
 	@echo "  make numbers-check     论文/README 数字与归档数据一致性（不一致即失败）"
 	@echo "  make name-check        项目名拼写一致性检查（规范名 Yat-CAShed）"
 	@echo "  make structure-check   目录布局 / 文档索引 / 构建产物 / 软著交付件守卫"
+	@echo "  make package           收齐结题材料到 report/submission/dist/"
 	@echo "  make symbol-check      内核头文件/实现符号一致性检查（静态）"
 	@echo "  make verify-all        check + docs-check + name-check + symbol-check + 补丁自检 + 模拟器全套验证"
 	@echo ""
@@ -67,6 +68,10 @@ numbers-check:
 # report（论文交付物）、patches（生成物）与二进制。
 name-check:
 	@python3 scripts/check_names.py
+
+# 结题材料打包：按序号收齐，附 SHA256 校验和
+package:
+	@bash scripts/collect_submission.sh
 
 # 仓库结构守卫：顶层布局、文档索引完整性、构建产物、软著交付件
 structure-check:

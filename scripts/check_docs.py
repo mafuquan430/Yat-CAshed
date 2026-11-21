@@ -42,7 +42,7 @@ EXPLICIT_GLOBS = [
 ]
 
 # 生成物/依赖目录，直接跳过
-SKIP_DIRS = {".git", "classes", "out", "result", "node_modules", "__pycache__", ".venv"}
+SKIP_DIRS = {".git", "classes", "out", "result", "node_modules", "__pycache__", ".venv", "dist"}
 
 # 归档件的链接基准覆盖：归档文件（相对仓库根） -> 归档前所在的目录（相对仓库根）
 # 归档正文不回填，因此按原目录解析才反映"当时这些链接指向哪里"。

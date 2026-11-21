@@ -7,7 +7,7 @@
 
 | 类别 | 交付物 | 规模 / 关键读数 | 入口 |
 |---|---|---|---|
-| 内核实现 | 缓存感知调度类 `yat_casched.c` | 2879 行 C，29 个对外声明，6 个回调 | `linux-6.8-main/kernel/sched/yat_casched.c` |
+| 内核实现 | 缓存感知调度类 `yat_casched.c` | 2950 行 C，29 个对外声明，6 个回调 | `linux-6.8-main/kernel/sched/yat_casched.c` |
 | 可观测性 | 33 项 debugfs 计数器 + 3 个 tracepoint | 覆盖唤醒 / 选核 / 落地 / 均衡 / 入队 / 历史表 / 选任务 | `/sys/kernel/debug/yat_casched/stats` |
 | 可重建性 | 6 个可独立应用的补丁 + SHA256 清单 | 按序应用后与工作树逐字节一致 | `patches/`、`make patch-check` |
 | 实测 | 3 配置 × 5 次 × 2 个镜像 | 主口径 1.812（#20）/ 2.002（#19） | `docs/validation/2026-11-13/kernel/` |

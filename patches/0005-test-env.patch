@@ -1626,7 +1626,7 @@ Upstream: linux v6.8 (torvalds)
 +# 「AJLR 在算但决策被亲和性/回落逻辑推翻」与「AJLR 真的接管了放置」。
 +if [ -d /sys/kernel/debug/yat_casched ]; then
 +    echo "YATDEBUG-BEGIN"
-+    for f in stats ready_pool dags placements; do
++    for f in stats recency_hist ready_pool dags placements; do
 +        echo "--- $f ---"
 +        /bin/busybox cat "/sys/kernel/debug/yat_casched/$f" 2>/dev/null
 +    done

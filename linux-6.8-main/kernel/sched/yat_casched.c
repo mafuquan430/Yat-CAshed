@@ -286,6 +286,38 @@ struct yat_casched_stats {
 
 static DEFINE_PER_CPU(struct yat_casched_stats, yat_stats);
 
+/*
+ * recency 直方图（路线 D 的标定工具）。
+ *
+ * 归一化窗口 max_recency 一直是猜的（1 ms）。要把它标定成有依据的值，
+ * 先得知道"真实的重用距离分布长什么样"。这里按 2 的幂分桶（微秒）：
+ * 桶 0 = [0,1) us，桶 k = [2^(k-1), 2^k) us，最高到 16 ms 量级。
+ *
+ * 采样点在 yat_get_crp_ratio()——与 crp_used 同频，因此直方图总和
+ * 应当等于 crp_used，两者可以互相校核。
+ */
+#define YAT_RECENCY_BUCKET_NR 21
+
+struct yat_recency_hist {
+	u64 bucket[YAT_RECENCY_BUCKET_NR];
+};
+
+static DEFINE_PER_CPU(struct yat_recency_hist, yat_recency_hist);
+
+static noinline void yat_recency_record(u64 recency)
+{
+	struct yat_recency_hist *h = this_cpu_ptr(&yat_recency_hist);
+	u64 us = div_u64(recency, NSEC_PER_USEC);
+	int b;
+
+	if (us < 1)
+		b = 0;
+	else
+		b = min_t(int, ilog2(us) + 1, YAT_RECENCY_BUCKET_NR - 1);
+
+	h->bucket[b]++;
+}
+
 /* debugfs 根节点：/sys/kernel/debug/yat_casched（未编译 DEBUG_FS 时为 NULL） */
 static struct dentry *yat_debugfs_root;
 
@@ -438,6 +470,42 @@ static const struct file_operations yat_stats_fops = {
  *   pool->lock」就构成真实的 ABBA 死锁。实跑 lockdep 已报出
  *   "possible irq lock inversion dependency detected"。
  */
+static int yat_recency_hist_show(struct seq_file *m, void *v)
+{
+	int b, cpu;
+	u64 total = 0;
+
+	for (b = 0; b < YAT_RECENCY_BUCKET_NR; b++) {
+		u64 sum = 0;
+
+		for_each_possible_cpu(cpu)
+			sum += per_cpu(yat_recency_hist.bucket[b], cpu);
+		if (!sum)
+			continue;
+		total += sum;
+		if (b == 0)
+			seq_printf(m, "%10llu   [0,1) us\n", sum);
+		else
+			seq_printf(m, "%10llu   [%llu,%llu) us\n", sum,
+				   1ULL << (b - 1), 1ULL << b);
+	}
+	seq_printf(m, "total      %llu\n", total);
+
+	return 0;
+}
+
+static int yat_recency_hist_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, yat_recency_hist_show, NULL);
+}
+
+static const struct file_operations yat_recency_hist_fops = {
+	.open = yat_recency_hist_open,
+	.read = seq_read,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
+
 static int yat_ready_pool_show(struct seq_file *m, void *v)
 {
 	struct yat_ready_job_pool *pool = READ_ONCE(global_ready_pool);
@@ -622,6 +690,8 @@ static int __init yat_debugfs_init(void)
 
 	debugfs_create_file("stats", 0444, yat_debugfs_root, NULL,
 			    &yat_stats_fops);
+	debugfs_create_file("recency_hist", 0444, yat_debugfs_root, NULL,
+			    &yat_recency_hist_fops);
 	debugfs_create_file("ready_pool", 0444, yat_debugfs_root, NULL,
 			    &yat_ready_pool_fops);
 	debugfs_create_file("dags", 0444, yat_debugfs_root, NULL,
@@ -2365,6 +2435,7 @@ u64 yat_sum_exec_time_multi(int *cpu_list, int cpu_count, u64 start_ts, u64 end_
 u64 yat_get_crp_ratio(u64 recency)
 {
     YAT_STAT_INC(crp_used);
+    yat_recency_record(recency);
 
     if (recency == 0)
         return 0;

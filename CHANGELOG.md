@@ -1047,3 +1047,12 @@ guest **静默挂死**（串口无输出、4 个 vCPU 全部 idle、`jobs_placed
   0008（就绪代际门禁）已并入 0001/0002 的最终形态；`make patch-check --selftest` 仍验证
   "按序应用后与工作树逐字节一致"。
 - `kernel/sched/yat_casched.c` 行数 2830 → 2862。
+
+## 2026-11-22 — P4：L2 按在线核数归一
+
+- `yat_calculate_recency()` 的 $L_2$ 求和后除以 `num_online_cpus()`，去掉"核多就饱和"的伪相关；
+  文件 2862 → **2879** 行，内核重编为 #26，补丁链重新生成（仍 6 个，selftest PASS）。
+- 实测：CRP 饱和率中位数 96.6%（3 轮）→ **0%**（5 轮，全距 0%–82.2%）；
+  成本比值中位 1.79（[1.68, 2.07]），与 #20 的 1.81 在噪声内。
+- 结论：归一化让 CRP 恢复分辨力，但双峰未消除，窗口本身仍需按 recency 分布标定（路线 D 下一步）。
+- 证据：`docs/validation/2026-11-22-crp-p4/`，对比图 `report/slides/img/fig-crp-sat.png`。

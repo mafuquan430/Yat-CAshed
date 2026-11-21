@@ -2415,6 +2415,23 @@ u64 yat_calculate_recency(int job_id, int cpu_id, u64 now)
     if (l2_last > 0) {
         for_each_online_cpu(cpu)
             l2_recency += yat_sum_exec_time_since(cpu, l2_last, now);
+
+        /*
+         * P4：按在线核数归一。
+         *
+         * 没有这一步时，l2_recency 是"所有核的干扰之和"：核越多、任务越忙，
+         * 这个值越大，与任务自己的重用距离无关。实测 4 核 8 任务时饱和率
+         * 96.6%，即缓存项恒为 0、排序退化成纯 WCET。
+         *
+         * 除以在线核数后，它变成"平均每核在这段时间里跑了多少活"，
+         * 与 l1_recency（单核干扰）同量纲，窗口 1 ms 才有意义。
+         */
+        if (l2_recency) {
+            unsigned int n = num_online_cpus();
+
+            if (n > 1)
+                l2_recency = div_u64(l2_recency, n);
+        }
     }
 
     /* L3 层（全局共享缓存）：与 L2 相同，简化处理 */

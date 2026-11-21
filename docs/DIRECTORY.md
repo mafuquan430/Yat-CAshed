@@ -95,7 +95,7 @@ Yat-CAShed/
     │   └── img/SYSULogo.png
     ├── prompt_md/               # 分析笔记（ajlr_paper_analysis / plan / test1）
     └── *.pdf / *.pptx / *.docx / *.txt   # 参考论文与早期材料
-├── patches/                     # 8 个补丁 + series + MANIFEST.sha256（可重建内核侧改动）
+├── patches/                     # 6 个补丁 + series + MANIFEST.sha256（可重建内核侧改动）
 └── soft-copyright/              # 软著材料包（01 申请表 / 02 源程序 / 03 说明书 / 04 签章 / 05 核验）
 ```
 

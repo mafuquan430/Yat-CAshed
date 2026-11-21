@@ -72,6 +72,16 @@
  */
 #define YAT_DECISION_MIN_INTERVAL_NS	1000000ULL	/* 1ms */
 
+/*
+ * CRP 归一化窗口：recency 一旦达到该值，就认为"缓存已彻底凉透"，比率钳到 1000。
+ *
+ * 单位是**纳秒**：1000000 ns = 1 ms，不是 1 秒（原实现直接写 1000000 并注释
+ * "1秒"，两处都错）。这个常数目前是占位值，没有经过标定——本轮负载的重用
+ * 距离在 2e5 ns 量级，窗口取 1 ms 时 CRP 项仍有分辨力；换到睡眠间隔更长、
+ * 核数更多的负载上会先饱和，然后静默退化成纯 WCET 排序（见 crp_sat 计数器）。
+ */
+#define YAT_CRP_MAX_RECENCY_NS	1000000ULL	/* 1ms，未经标定 */
+
 /* 每个 CPU 历史表的软上限，超过后触发一次惰性裁剪，防止无限增长 */
 #define YAT_HISTORY_MAX_RECORDS	512
 
@@ -207,6 +217,17 @@ struct yat_casched_stats {
 	u64 select_decided;		/* 真正跑完 AJLR 并返回新核心 */
 
 	/*
+	 * CRP 是否还活着（路线 D 的探针）。
+	 *
+	 * crp_used 按"候选核"计：yat_find_best_core_for_job() 对每个可用核都要
+	 * 算一次比率，所以它天然是 select_decided 的若干倍。
+	 * crp_sat 是其中撞上 YAT_CRP_MAX_RECENCY_NS 的次数——一旦 crp_sat/crp_used
+	 * 接近 1，说明缓存项已经恒为 0，排序退化成纯 WCET，而整个系统不会报错。
+	 */
+	u64 crp_used;		/* 调用 yat_get_crp_ratio() 的次数 */
+	u64 crp_sat;		/* 其中 recency 达到窗口上限、比率被钳到 1000 的次数 */
+
+	/*
 	 * enqueue 侧探针：用来回答「为什么 select_task_rq 没被调用」。
 	 *
 	 * core.c:3644 的包装层只有在 p->nr_cpus_allowed > 1 时才会转发到
@@ -339,6 +360,8 @@ static int yat_stats_show(struct seq_file *m, void *v)
 	seq_printf(m, "select_sticky_intv %llu\n", YAT_STAT_SUM(select_sticky_interval));
 	seq_printf(m, "select_nocore     %llu\n", YAT_STAT_SUM(select_nocore));
 	seq_printf(m, "select_decided    %llu\n", YAT_STAT_SUM(select_decided));
+	seq_printf(m, "crp_used          %llu\n", YAT_STAT_SUM(crp_used));
+	seq_printf(m, "crp_sat           %llu\n", YAT_STAT_SUM(crp_sat));
 	seq_printf(m, "enq_calls         %llu\n", YAT_STAT_SUM(enq_calls));
 	seq_printf(m, "enq_cpus_allowed  %llu\n", YAT_STAT_SUM(enq_cpus_allowed_sum));
 	seq_printf(m, "ttwu_state_bail   %llu\n", YAT_STAT_SUM(ttwu_state_bail));
@@ -2329,20 +2352,29 @@ u64 yat_sum_exec_time_multi(int *cpu_list, int cpu_count, u64 start_ts, u64 end_
     return total_sum;
 }
 
-/* 简化的CRP比率计算 */
+/*
+ * CRP 比率：把 recency（自上次运行以来该核上跑过的执行时间总和）
+ * 归一化成 0..1000 的千分比。0 = 刚跑过（热），1000 = 凉透（等于没有收益）。
+ *
+ * 两个计数器就是为了回答"这个模型还活着吗"：
+ *   crp_used 每次计算都加一；
+ *   crp_sat  只在撞上窗口上限时加一。饱和意味着 benefit 恒为 0，
+ *            MSF 退化成纯 WCET 排序——而这不会产生任何报错，
+ *            所以必须靠计数器显式暴露出来。
+ */
 u64 yat_get_crp_ratio(u64 recency)
 {
-    /* 简化实现：recency越大，CRP比率越大 */
-    /* 返回千分比形式的比率，避免浮点运算 */
+    YAT_STAT_INC(crp_used);
+
     if (recency == 0)
         return 0;
-    
-    /* 假设最大recency为某个阈值，进行归一化 */
-    u64 max_recency = 1000000; /* 1秒，根据实际情况调整 */
-    if (recency >= max_recency)
-        return 1000; /* 100% */
-    
-    return (recency * 1000) / max_recency;
+
+    if (recency >= YAT_CRP_MAX_RECENCY_NS) {
+        YAT_STAT_INC(crp_sat);
+        return 1000;
+    }
+
+    return (recency * 1000) / YAT_CRP_MAX_RECENCY_NS;
 }
 
 /*

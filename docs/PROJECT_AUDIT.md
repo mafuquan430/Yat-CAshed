@@ -104,7 +104,7 @@ make check        → exit 0（无冲突标记 / 无空文件 / 关键文件齐�
 make docs-check   → exit 0（23 个 Markdown，154 条链接，0 失效）
 make symbol-check → exit 0（26 声明 / 26 非 static / 17 static）
 make simulator-test  → 102/102 断言通过
-make report       → exit 0（25 页 PDF，0 缺字警告）
+make report       → exit 0（26 页 PDF，0 缺字警告）
 ```
 
 CI 现包含：仓库检查、文档链接检查、符号一致性、冲突标记独立复核、模拟器编译 + 依赖自检 + 单测 + 快速回放。

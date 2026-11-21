@@ -1,19 +1,7 @@
 From: Yat-CAShed <noreply@example.com>
-Subject: [PATCH] test-env: QEMU test environments and CFS-vs-Yat benchmark
-
+Subject: [PATCH] test: add Yat QEMU boot/test environments and CFS-vs-Yat benchmark
 Upstream: linux v6.8 (torvalds)
 
-新增（只含源码与脚本，不含编译产物）：
-  - boot_test_scripts/: yat_simple_test.c / yat_bench.c / yat_affinity_test.c 与说明
-  - yat_test_scripts/: initramfs 生成、QEMU 启动、cfs vs yat 对比等脚本
-  - test_visualization/: 可视化脚本与样例数据
-
-本版修掉上一版补丁的两个问题：
-  1. 文件在 yat_affinity_test.c 的最后一个 hunk 中被截断，
-     git apply 报 "corrupt patch at line 3276"；
-  2. compare_cfs_vs_yat.sh 缺少并发锁（两个实例并行会互相覆盖 results/）。
-
----
 --- /dev/null
 +++ b/boot_test_scripts/README.md
 @@ -0,0 +1,137 @@
@@ -154,7 +142,6 @@ Upstream: linux v6.8 (torvalds)
 +- 性能对比实验设计与结论：[`../../docs/EXPERIMENT_REPORT.md`](../../docs/EXPERIMENT_REPORT.md)
 +- 性能测试与图表：[`../test_visualization/README.md`](../test_visualization/README.md)
 +- 内核构建说明：[`../../docs/DEVELOPMENT.md`](../../docs/DEVELOPMENT.md)
-
 --- /dev/null
 +++ b/boot_test_scripts/SIMPLE_TEST_README.md
 @@ -0,0 +1,64 @@
@@ -222,7 +209,61 @@ Upstream: linux v6.8 (torvalds)
 +## 退出 QEMU
 +
 +`Ctrl+A` 然后按 `X`；或在 guest shell 中执行 `halt`。
-
+--- /dev/null
++++ b/boot_test_scripts/yat_affinity_test.c
+@@ -0,0 +1,51 @@
++#define _GNU_SOURCE
++#include <sched.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <unistd.h>
++#include <time.h>
++#include <errno.h>
++
++/* Four-vCPU guest required. Inspect AJLR intent, not only core fallback. */
++static int phase(int first)
++{
++    cpu_set_t mask;
++    CPU_ZERO(&mask); CPU_SET(first, &mask); CPU_SET(first + 1, &mask);
++    if (sched_setaffinity(0, sizeof(mask), &mask)) { perror("affinity"); return 1; }
++    cpu_set_t effective;
++    CPU_ZERO(&effective);
++    if (sched_getaffinity(0, sizeof(effective), &effective)) { perror("getaffinity"); return 6; }
++    if (!CPU_EQUAL(&effective, &mask)) {
++        printf("MASK-MISMATCH requested=%d,%d count=%d\n", first, first+1, CPU_COUNT(&effective));
++        return 7;
++    }
++    for (int i = 0; i < 100; i++) {
++        struct timespec pause = {0, 2000000};
++        if (nanosleep(&pause, NULL)) { perror("nanosleep"); return 1; }
++        int actual = sched_getcpu();
++        if (actual != first && actual != first + 1) { printf("RUN-MISMATCH actual=%d mask=%d,%d\n", actual, first, first+1); return 2; }
++    }
++    FILE *f = fopen("/sys/kernel/debug/yat_casched/placements", "r");
++    if (!f) { perror("placements"); return 3; }
++    char line[256]; int found = 0, bad = 0;
++    while (fgets(line, sizeof(line), f)) {
++        int job, pid, prio, assigned, actual;
++        if (sscanf(line, "%d%d%d%d%d", &job, &pid, &prio, &assigned, &actual) == 5 && pid == getpid()) {
++            found = 1;
++            printf("PHASE mask=%d,%d assigned=%d actual=%d\n", first, first+1, assigned, actual);
++            bad = assigned != first && assigned != first + 1;
++        }
++    }
++    fclose(f);
++    return !found ? 4 : bad ? 5 : 0;
++}
++int main(void)
++{
++    struct sched_param param = {0};
++    if (sched_setscheduler(0, 8, &param)) { perror("SCHED_YAT_CASCHED"); return 1; }
++    int rc = phase(0);
++    if (!rc) rc = phase(2);
++    if (!rc) rc = phase(0);
++    printf("YAT-AFFINITY %s rc=%d\n", rc ? "FAIL" : "PASS", rc);
++    return rc;
++}
+\ No newline at end of file
 --- /dev/null
 +++ b/boot_test_scripts/yat_bench.c
 @@ -0,0 +1,592 @@
@@ -818,7 +859,6 @@ Upstream: linux v6.8 (torvalds)
 +
 +	return 0;
 +}
-
 --- /dev/null
 +++ b/boot_test_scripts/yat_simple_test.c
 @@ -0,0 +1,162 @@
@@ -984,7 +1024,6 @@ Upstream: linux v6.8 (torvalds)
 +    
 +    return 0;
 +}
-
 --- /dev/null
 +++ b/yat_test_scripts/README.md
 @@ -0,0 +1,225 @@
@@ -1213,7 +1252,6 @@ Upstream: linux v6.8 (torvalds)
 +| 权限错误 | `chmod +x ./*.sh` |
 +| 编译失败 | 检查 `gcc` 与 `../boot_test_scripts/*.c`；失败项会被跳过并打印原因 |
 +| CSV 里某字段空 / `integer expression expected` | 串口是 CRLF，脚本已 `tr -d '\r'`；若自行改脚本要记得保留 |
-
 --- /dev/null
 +++ b/yat_test_scripts/build_yat_simple_test.sh
 @@ -0,0 +1,114 @@
@@ -1331,7 +1369,6 @@ Upstream: linux v6.8 (torvalds)
 +echo ""
 +echo "启动测试:"
 +echo "  cd $SCRIPT_DIR && ./start_yat_simple_test.sh"
-
 --- /dev/null
 +++ b/yat_test_scripts/compare_cfs_vs_yat.sh
 @@ -0,0 +1,519 @@
@@ -1854,7 +1891,6 @@ Upstream: linux v6.8 (torvalds)
 +echo "注意：TCG 模拟下单次测量噪声较大，结论请以多次重复的中位数/分布为准，"
 +echo "      不要用单次 sum_wall 的小幅差异当作算法结论。"
 +echo "=========================================="
-
 --- /dev/null
 +++ b/yat_test_scripts/create_test_initramfs.sh
 @@ -0,0 +1,142 @@
@@ -2000,7 +2036,6 @@ Upstream: linux v6.8 (torvalds)
 +echo "  qemu-system-x86_64 -nographic -m 1024 -smp 4 \\"
 +echo "      -kernel arch/x86/boot/bzImage \\"
 +echo "      -initrd $OUT_IMAGE -append \"console=ttyS0,115200 panic=1 nokaslr\" -accel tcg"
-
 --- /dev/null
 +++ b/yat_test_scripts/manual_test_guide.sh
 @@ -0,0 +1,53 @@
@@ -2057,7 +2092,6 @@ Upstream: linux v6.8 (torvalds)
 +echo "- 所有命令都在 QEMU 虚拟机的终端中运行"
 +echo "- 要退出虚拟机: 输入 'exit'，然后按 Ctrl+A 再按 X"
 +echo "- 观察调度器行为时注意进程的 CPU 使用率分布"
-
 --- /dev/null
 +++ b/yat_test_scripts/quick_test_guide.sh
 @@ -0,0 +1,70 @@
@@ -2131,7 +2165,6 @@ Upstream: linux v6.8 (torvalds)
 +
 +echo "🚪 退出方式："
 +echo "在虚拟机中输入 'exit'，然后按 Ctrl+A 再按 X"
-
 --- /dev/null
 +++ b/yat_test_scripts/start_qemu_simple.sh
 @@ -0,0 +1,111 @@
@@ -2246,7 +2279,6 @@ Upstream: linux v6.8 (torvalds)
 +    -no-reboot \
 +    -append "console=ttyS0,115200 panic=1 nokaslr quiet" \
 +    -accel tcg
-
 --- /dev/null
 +++ b/yat_test_scripts/start_qemu_yat_test.sh
 @@ -0,0 +1,63 @@
@@ -2313,7 +2345,6 @@ Upstream: linux v6.8 (torvalds)
 +
 +echo ""
 +echo "QEMU 测试环境已关闭。"
-
 --- /dev/null
 +++ b/yat_test_scripts/start_test_environment.sh
 @@ -0,0 +1,78 @@
@@ -2395,7 +2426,6 @@ Upstream: linux v6.8 (torvalds)
 +    -no-reboot \
 +    -accel tcg \
 +    -append "console=ttyS0,115200 panic=1 nokaslr"
-
 --- /dev/null
 +++ b/yat_test_scripts/start_yat_simple_test.sh
 @@ -0,0 +1,61 @@
@@ -2460,7 +2490,6 @@ Upstream: linux v6.8 (torvalds)
 +echo ""
 +echo "QEMU 已退出"
 +echo "查看完整日志: cat $LOG_FILE"
-
 --- /dev/null
 +++ b/test_visualization/README.md
 @@ -0,0 +1,184 @@
@@ -2648,7 +2677,6 @@ Upstream: linux v6.8 (torvalds)
 +
 +> 说明：`img/` 下为历史运行产物，已纳入版本控制用于留档；
 +> 重新运行 `visualize_results.py` 会覆盖同名文件。
-
 --- /dev/null
 +++ b/test_visualization/debug_scheduler.c
 @@ -0,0 +1,68 @@
@@ -2720,7 +2748,6 @@ Upstream: linux v6.8 (torvalds)
 +    test_scheduler_behavior();
 +    return 0;
 +}
-
 --- /dev/null
 +++ b/test_visualization/performance_test.c
 @@ -0,0 +1,273 @@
@@ -2997,7 +3024,6 @@ Upstream: linux v6.8 (torvalds)
 +    printf("\nTest completed. Check test_visualization/ folder for results.\n");
 +    return 0;
 +}
-
 --- /dev/null
 +++ b/test_visualization/visualize_results.py
 @@ -0,0 +1,214 @@
@@ -3215,7 +3241,6 @@ Upstream: linux v6.8 (torvalds)
 +
 +if __name__ == "__main__":
 +    main()
-
 --- /dev/null
 +++ b/test_visualization/performance_results.csv
 @@ -0,0 +1,17 @@
@@ -3236,7 +3261,6 @@ Upstream: linux v6.8 (torvalds)
 +Yat-CAShed,6,3,1.148,0.940
 +CFS,7,5,1.138,0.865
 +Yat-CAShed,7,4,1.143,0.626
-
 --- /dev/null
 +++ b/test_visualization/img/performance_summary.md
 @@ -0,0 +1,27 @@
@@ -3267,60 +3291,4 @@ Upstream: linux v6.8 (torvalds)
 +
 +## Conclusion
 +Yat-CAShed shows clear advantages in reducing CPU migrations and improving performance.
-\ No newline at end of file
-
---- /dev/null
-+++ b/boot_test_scripts/yat_affinity_test.c
-@@ -0,0 +1,51 @@
-+#define _GNU_SOURCE
-+#include <sched.h>
-+#include <stdio.h>
-+#include <stdlib.h>
-+#include <unistd.h>
-+#include <time.h>
-+#include <errno.h>
-+
-+/* Four-vCPU guest required. Inspect AJLR intent, not only core fallback. */
-+static int phase(int first)
-+{
-+    cpu_set_t mask;
-+    CPU_ZERO(&mask); CPU_SET(first, &mask); CPU_SET(first + 1, &mask);
-+    if (sched_setaffinity(0, sizeof(mask), &mask)) { perror("affinity"); return 1; }
-+    cpu_set_t effective;
-+    CPU_ZERO(&effective);
-+    if (sched_getaffinity(0, sizeof(effective), &effective)) { perror("getaffinity"); return 6; }
-+    if (!CPU_EQUAL(&effective, &mask)) {
-+        printf("MASK-MISMATCH requested=%d,%d count=%d\n", first, first+1, CPU_COUNT(&effective));
-+        return 7;
-+    }
-+    for (int i = 0; i < 100; i++) {
-+        struct timespec pause = {0, 2000000};
-+        if (nanosleep(&pause, NULL)) { perror("nanosleep"); return 1; }
-+        int actual = sched_getcpu();
-+        if (actual != first && actual != first + 1) { printf("RUN-MISMATCH actual=%d mask=%d,%d\n", actual, first, first+1); return 2; }
-+    }
-+    FILE *f = fopen("/sys/kernel/debug/yat_casched/placements", "r");
-+    if (!f) { perror("placements"); return 3; }
-+    char line[256]; int found = 0, bad = 0;
-+    while (fgets(line, sizeof(line), f)) {
-+        int job, pid, prio, assigned, actual;
-+        if (sscanf(line, "%d%d%d%d%d", &job, &pid, &prio, &assigned, &actual) == 5 && pid == getpid()) {
-+            found = 1;
-+            printf("PHASE mask=%d,%d assigned=%d actual=%d\n", first, first+1, assigned, actual);
-+            bad = assigned != first && assigned != first + 1;
-+        }
-+    }
-+    fclose(f);
-+    return !found ? 4 : bad ? 5 : 0;
-+}
-+int main(void)
-+{
-+    struct sched_param param = {0};
-+    if (sched_setscheduler(0, 8, &param)) { perror("SCHED_YAT_CASCHED"); return 1; }
-+    int rc = phase(0);
-+    if (!rc) rc = phase(2);
-+    if (!rc) rc = phase(0);
-+    printf("YAT-AFFINITY %s rc=%d\n", rc ? "FAIL" : "PASS", rc);
-+    return rc;
-+}
 \ No newline at end of file

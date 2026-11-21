@@ -23,7 +23,7 @@ Yat-CAShed 基于 AJLR（Allocation of parallel Jobs based on Learned cache Rece
 |---|---|---|
 | 落在真内核，不是模拟器 | 实现为 `sched_class`（策略号 8），回调时机、锁上下文、亲和性语义全部由内核决定 | 仿真里"算法便宜"的结论，在真内核里会被接入成本吞掉；本文把两者分开报 |
 | 代价可分解 | 三组配置消融（完整链路 / 回调不进 / 无唤醒），两两相减得到选核边际代价 ≈ 5% | 只报一个总比值的工作，无法回答"该优化哪里" |
-| 结论可证伪 | 31 项 debugfs 计数器 + 3 个 tracepoint，每条断言都有对应读数与反例信号 | 计数器的确定性使"改完立刻判对错"成为可能，不必等统计显著 |
+| 结论可证伪 | 33 项 debugfs 计数器 + 3 个 tracepoint，每条断言都有对应读数与反例信号 | 计数器的确定性使"改完立刻判对错"成为可能，不必等统计显著 |
 | 数字不可分叉 | 论文/README/说明书的数字由脚本从归档 CSV 重算，66 项比对失败即阻断 | 文档与数据的漂移是这类项目最常见的隐性错误 |
 
 ## 项目主页
@@ -69,7 +69,7 @@ Yat-CAShed/
 ├── Makefile                     # 顶层编排（check / docs-check / simulator / report）
 ├── .editorconfig / .gitattributes / .gitignore
 ├── docs/                        # 工程化文档体系（入口见 docs/README.md）
-├── patches/                     # 8 个可独立应用的内核补丁（替代内核整树入库）
+├── patches/                     # 6 个可独立应用的内核补丁（替代内核整树入库）
 ├── soft-copyright/              # 软著登记材料包（申请表稿 / 60 页源码 / 21 页说明书）
 ├── scripts/                     # 仓库运维脚本
 │   ├── check_repo.sh / check_symbols.sh / check_docs.py / check_names.py   # 门禁

@@ -21,11 +21,11 @@
 \toprule
 载体 & 规模 & 入口 \\
 \midrule
-\texttt{kernel/sched/yat\_casched.c} & 2830 行 C & \texttt{make kernel-build} \\
+\texttt{kernel/sched/yat\_casched.c} & 2862 行 C & \texttt{make kernel-build} \\
 \texttt{include/linux/sched/yat\_casched.h} & 266 行，29 个声明 & \texttt{make symbol-check} \\
 \texttt{include/trace/events/yat\_casched.h} & 228 行，3 个 tracepoint & \texttt{debugfs} 寄存器组 \\
 \texttt{yat\_test\_scripts/} & 3 配置 $\times$ 5 次 $\times$ 2 个镜像 & \texttt{compare\_cfs\_vs\_yat.sh} \\
-\texttt{patches/}（8 个补丁） & 逐字节重建当前树 & \texttt{make patch-check} \\
+\texttt{patches/}（6 个补丁） & 逐字节重建当前树 & \texttt{make patch-check} \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -37,8 +37,8 @@
 本文是"把系统做完、测完、核对完"之后的工程记录，四件事按依赖顺序排列：
 
 \begin{enumerate}
-    \item \textbf{实现}：在 Linux 6.8 上新增内置调度类 \texttt{SCHED\_YAT\_CASCHED}（策略号 8），完成选核、DAG/作业生命周期、每核历史表、加速表、31 项计数器与 \texttt{debugfs} 观测接口，并固化成 8 个可独立应用的补丁。
-    \item \textbf{修复}：定位并修掉一处被 \texttt{lockdep} 实证的锁反序（\texttt{task\_dead} 在开中断上下文销毁作业，与 balance 路径构成 ABBA）；重建镜像复跑两组对照，同类告警计数归零，修复固化为补丁 \texttt{0007}。
+    \item \textbf{实现}：在 Linux 6.8 上新增内置调度类 \texttt{SCHED\_YAT\_CASCHED}（策略号 8），完成选核、DAG/作业生命周期、每核历史表、加速表、33 项计数器与 \texttt{debugfs} 观测接口，并固化成 6 个可独立应用的补丁。
+    \item \textbf{修复}：定位并修掉一处被 \texttt{lockdep} 实证的锁反序（\texttt{task\_dead} 在开中断上下文销毁作业，与 balance 路径构成 ABBA）；重建镜像复跑两组对照，同类告警计数归零，修复并入发布补丁 \texttt{0001}。
     \item \textbf{测量与归因}：同一份负载、同一个二进制，用三组配置各重复 5 次。主口径给出总代价（1.81 倍），单核 pin 与无唤醒两组把总代价拆成"选核"与"接入"两笔，得到"选核只占约 5\%"这个可执行的结论（\S\ref{sec:test}）。
     \item \textbf{闭环优化}：由计数器指出的空转（\texttt{balance\_runs}=757 而唤醒仅 512 次）驱动出"就绪代际门禁"，把 98.6\% 的 balance 调用变成不取锁的快速路径，并让主口径从 2.00 降到 1.81（\S\ref{sec:test}）。
 \end{enumerate}
@@ -58,7 +58,7 @@
 \toprule
 优势 & 证据（仓库内可复查） & 为什么成立 \\
 \midrule
-实现完整、可重建 & 8 个补丁可独立应用，按序应用后与工作树逐字节一致；\texttt{bzImage} 启动 4 vCPU；15 次测量共 30 次独立启动，零 \texttt{lockdep}/BUG & 补丁往返校验把"能编译"升级为"能重建"；告警计数是二值事实，不随负载波动 \\
+实现完整、可重建 & 6 个补丁可独立应用，按序应用后与工作树逐字节一致；\texttt{bzImage} 启动 4 vCPU；15 次测量共 30 次独立启动，零 \texttt{lockdep}/BUG & 补丁往返校验把"能编译"升级为"能重建"；告警计数是二值事实，不随负载波动 \\
 成本可分解，而非只有一个总比值 & 三配置$\times$5 次：1.81 / 1.72 / 0.84 & 单核 pin 使 \texttt{nr\_cpus\_allowed==1}，\texttt{core.c} 包装层直接返回，调度类回调一次都不进；无唤醒只剩 \texttt{WF\_FORK}。三格消融把"算法成本"与"接入成本"分开 \\
 结论落到具体代码 & 选核边际 $1.81/1.72\approx5\%$（优化前 $\approx18\%$）；1.72 指到入队与选核路径 & 两格之比是同一负载下"多跑一次 AJLR"的净代价，不是拟合出来的系数 \\
 优化有确定性验收 & \texttt{balance\_runs} $757\to9$、\texttt{balance\_noop}=621、\texttt{jobs\_placed} $271\to172$ & 计数器是同一负载下的确定性量，不受 TCG 约 28\% 抖动影响，改完立刻能判对错 \\

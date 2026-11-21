@@ -87,7 +87,7 @@ symbol-check / patch-check / simulator-verify —— 全绿。
   `yat_scanned_gen`。作业创建时无前驱、或最后一个前驱完成时加一；`balance` 只在代际
   变化时扫描就绪池，池空且代际未变时在取 `yat_balance_lock` 之前返回。
 - 新增三个计数器：`balance_noop`（空转快路径）、`pool_scans`（真实扫描）、
-  `pool_scan_skips`（代际未变而跳过）。debugfs 计数器由 28 项增至 31 项。
+  `pool_scan_skips`（代际未变而跳过）。debugfs 计数器由 28 项增至 33 项。
 - `patches/0008-sched-yat-casched-ready-generation.patch`：Route A 固化为可独立应用的补丁，
   `series`/`MANIFEST.sha256`/`patches/README.md` 同步。
 
@@ -1037,3 +1037,13 @@ guest **静默挂死**（串口无输出、4 个 vCPU 全部 idle、`jobs_placed
 
 ## 2026-10-30
 - 修复CLI单种子无法覆盖YAML多种子、环境配置缺失静默回落的问题；集成测试遵循JAVA_HOME，Windows隔离编译及116项断言通过。
+
+## 2026-11-21 — CRP 探针与补丁链合并
+
+- 新增 `crp_used` / `crp_sat` 两个计数器，debugfs 计数器由 31 项增至 **33 项**；
+  首次实测 CRP 饱和率 96.6%（两次）与 5.3%（一次），据此把"饱和率 < 20%"登记为验收判据。
+- `max_recency` 提为 `YAT_CRP_MAX_RECENCY_NS` 并修正"1 秒"注释笔误（实际 1 毫秒）。
+- 补丁链重排：由 8 个（0001–0008）合并为 **6 个**（0001–0006）。原 0007（锁反序修复）与
+  0008（就绪代际门禁）已并入 0001/0002 的最终形态；`make patch-check --selftest` 仍验证
+  "按序应用后与工作树逐字节一致"。
+- `kernel/sched/yat_casched.c` 行数 2830 → 2862。

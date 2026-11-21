@@ -504,7 +504,7 @@ Upstream: linux v6.8 (torvalds)
 +#include <trace/define_trace.h>
 --- /dev/null
 +++ b/kernel/sched/yat_casched.c
-@@ -0,0 +1,2729 @@
+@@ -0,0 +1,2862 @@
 +/*
 + * Yat-CAShed - AJLR层级化DAG调度器 (Decision Final Version)
 + *
@@ -579,6 +579,16 @@ Upstream: linux v6.8 (torvalds)
 + */
 +#define YAT_DECISION_MIN_INTERVAL_NS	1000000ULL	/* 1ms */
 +
++/*
++ * CRP 归一化窗口：recency 一旦达到该值，就认为"缓存已彻底凉透"，比率钳到 1000。
++ *
++ * 单位是**纳秒**：1000000 ns = 1 ms，不是 1 秒（原实现直接写 1000000 并注释
++ * "1秒"，两处都错）。这个常数目前是占位值，没有经过标定——本轮负载的重用
++ * 距离在 2e5 ns 量级，窗口取 1 ms 时 CRP 项仍有分辨力；换到睡眠间隔更长、
++ * 核数更多的负载上会先饱和，然后静默退化成纯 WCET 排序（见 crp_sat 计数器）。
++ */
++#define YAT_CRP_MAX_RECENCY_NS	1000000ULL	/* 1ms，未经标定 */
++
 +/* 每个 CPU 历史表的软上限，超过后触发一次惰性裁剪，防止无限增长 */
 +#define YAT_HISTORY_MAX_RECORDS	512
 +
@@ -643,6 +653,25 @@ Upstream: linux v6.8 (torvalds)
 +static struct list_head global_dag_list = LIST_HEAD_INIT(global_dag_list); /* 活动DAG列表 */
 +static DEFINE_SPINLOCK(global_dag_lock);                       /* DAG列表锁 */
 +static struct yat_dag_task *global_default_dag;                /* 传统任务的默认DAG */
++
++/*
++ * 就绪代际（Route A）。
++ *
++ * 问题：balance 回调无条件调用 yat_update_ready_pool()，而它要在
++ * global_dag_lock 下遍历所有 DAG、每个 DAG 下再遍历所有作业。实测
++ * balance_runs = 757 而唤醒只有 512 次 —— 绝大多数调用发生时池里
++ * 并没有任何新东西，扫描纯属浪费；而且在 TCG 下每次取自旋锁都要
++ * 付出跨 vCPU 的代价。
++ *
++ * 做法：把"某个作业变成就绪"记成一个全局代际号 yat_ready_gen。
++ *   - 作业创建时无前驱            → 已就绪，代际 +1；
++ *   - 作业的最后一个前驱完成       → 就绪，代际 +1；
++ *   - balance 只在代际变化时扫描，并把 yat_scanned_gen 推进到快照值；
++ *   - 并发发生的就绪事件会让代际再次变化，因此不会漏扫。
++ * 池空且代际未变时，balance 连 yat_balance_lock 都不取就返回。
++ */
++static atomic_t yat_ready_gen = ATOMIC_INIT(0);		/* 就绪事件代际 */
++static atomic_t yat_scanned_gen = ATOMIC_INIT(-1);	/* 上次扫描看到的代际 */
 +static atomic_t next_dag_id = ATOMIC_INIT(1);                  /* DAG ID分配器 */
 +static atomic_t next_job_id = ATOMIC_INIT(1);                  /* 作业ID分配器 */
 +
@@ -661,6 +690,9 @@ Upstream: linux v6.8 (torvalds)
 +struct yat_casched_stats {
 +	u64 balance_runs;	/* balance 回调真正拿到全局锁的次数 */
 +	u64 balance_skips;	/* 抢锁失败、本次跳过的次数（说明争用程度） */
++	u64 balance_noop;	/* 池空且无新就绪：连全局锁都没取的"空转"次数 */
++	u64 pool_scans;		/* 真正执行了就绪池全表扫描的次数 */
++	u64 pool_scan_skips;	/* 代际未变、跳过全表扫描的次数 */
 +	u64 jobs_placed;	/* AJLR 成功完成 (job, cpu) 分配的次数 */
 +	u64 jobs_nocore;	/* 就绪作业但找不到可用核心的次数 */
 +	u64 history_records;	/* 写入历史表的执行区间条数 */
@@ -690,6 +722,17 @@ Upstream: linux v6.8 (torvalds)
 +	u64 select_sticky_interval;	/* 节流(b)：距上次决策不足最小间隔 */
 +	u64 select_nocore;		/* 扫遍所有核也没有可用核心 */
 +	u64 select_decided;		/* 真正跑完 AJLR 并返回新核心 */
++
++	/*
++	 * CRP 是否还活着（路线 D 的探针）。
++	 *
++	 * crp_used 按"候选核"计：yat_find_best_core_for_job() 对每个可用核都要
++	 * 算一次比率，所以它天然是 select_decided 的若干倍。
++	 * crp_sat 是其中撞上 YAT_CRP_MAX_RECENCY_NS 的次数——一旦 crp_sat/crp_used
++	 * 接近 1，说明缓存项已经恒为 0，排序退化成纯 WCET，而整个系统不会报错。
++	 */
++	u64 crp_used;		/* 调用 yat_get_crp_ratio() 的次数 */
++	u64 crp_sat;		/* 其中 recency 达到窗口上限、比率被钳到 1000 的次数 */
 +
 +	/*
 +	 * enqueue 侧探针：用来回答「为什么 select_task_rq 没被调用」。
@@ -799,6 +842,9 @@ Upstream: linux v6.8 (torvalds)
 +{
 +	seq_printf(m, "balance_runs      %llu\n", YAT_STAT_SUM(balance_runs));
 +	seq_printf(m, "balance_skips     %llu\n", YAT_STAT_SUM(balance_skips));
++	seq_printf(m, "balance_noop      %llu\n", YAT_STAT_SUM(balance_noop));
++	seq_printf(m, "pool_scans        %llu\n", YAT_STAT_SUM(pool_scans));
++	seq_printf(m, "pool_scan_skips   %llu\n", YAT_STAT_SUM(pool_scan_skips));
 +	seq_printf(m, "jobs_placed       %llu\n", YAT_STAT_SUM(jobs_placed));
 +	seq_printf(m, "jobs_nocore       %llu\n", YAT_STAT_SUM(jobs_nocore));
 +	seq_printf(m, "history_records   %llu\n", YAT_STAT_SUM(history_records));
@@ -821,6 +867,8 @@ Upstream: linux v6.8 (torvalds)
 +	seq_printf(m, "select_sticky_intv %llu\n", YAT_STAT_SUM(select_sticky_interval));
 +	seq_printf(m, "select_nocore     %llu\n", YAT_STAT_SUM(select_nocore));
 +	seq_printf(m, "select_decided    %llu\n", YAT_STAT_SUM(select_decided));
++	seq_printf(m, "crp_used          %llu\n", YAT_STAT_SUM(crp_used));
++	seq_printf(m, "crp_sat           %llu\n", YAT_STAT_SUM(crp_sat));
 +	seq_printf(m, "enq_calls         %llu\n", YAT_STAT_SUM(enq_calls));
 +	seq_printf(m, "enq_cpus_allowed  %llu\n", YAT_STAT_SUM(enq_cpus_allowed_sum));
 +	seq_printf(m, "ttwu_state_bail   %llu\n", YAT_STAT_SUM(ttwu_state_bail));
@@ -1396,6 +1444,10 @@ Upstream: linux v6.8 (torvalds)
 +    list_add_tail(&job->job_list, &dag->jobs);
 +    dag->total_jobs++;
 +    spin_unlock(&dag->lock);
++
++    /* 无前驱的作业创建即就绪，推进代际让 balance 扫到它 */
++    if (job->pending_predecessors == 0)
++        atomic_inc(&yat_ready_gen);
 +    
 +    return job;
 +}
@@ -1508,6 +1560,9 @@ Upstream: linux v6.8 (torvalds)
 +        list_del_init(&succ->predecessors);
 +        if (succ->pending_predecessors > 0)
 +            succ->pending_predecessors--;
++        /* 最后一个前驱完成 → 该作业就绪，推进代际 */
++        if (succ->pending_predecessors == 0)
++            atomic_inc(&yat_ready_gen);
 +    }
 +    return;
 +
@@ -2591,6 +2646,23 @@ Upstream: linux v6.8 (torvalds)
 +
 +int balance_yat_casched(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
 +{
++    struct yat_ready_job_pool *pool = rq->yat_casched.ready_pool;
++
++    /*
++     * 快速路径（Route A）：就绪池为空，且自上次扫描以来没有任何作业
++     * 变成就绪 —— 这一轮 balance 不可能产出分配。此时连
++     * yat_balance_lock 都不取：实测 balance 的调用次数约为唤醒次数的
++     * 1.5 倍，其中绝大多数属于这种空转。
++     *
++     * 注意顺序：先读池长度、再读代际。若二者之间恰好有作业入池，
++     * 该入池者自己的 wakeup 路径会触发 resched，不会丢作业。
++     */
++    if (pool && READ_ONCE(pool->nr_jobs) == 0 &&
++        atomic_read(&yat_ready_gen) == atomic_read(&yat_scanned_gen)) {
++        YAT_STAT_INC(balance_noop);
++        return 0;
++    }
++
 +    if (!spin_trylock(&yat_balance_lock)) {
 +        /*
 +         * 抢不到锁说明另一颗 CPU 正在做全局分配。这个计数是「争用强度」
@@ -2698,12 +2770,35 @@ Upstream: linux v6.8 (torvalds)
 +static void task_dead_yat_casched(struct task_struct *p)
 +{
 +    struct yat_job *job = READ_ONCE(p->yat_casched.job);
++    unsigned long flags;
 +
 +    if (!job)
 +        return;
 +
 +    WRITE_ONCE(p->yat_casched.job, NULL);
++
++    /*
++     * 关中断后再销毁。
++     *
++     * 这里不是"多此一举"：yat_destroy_job() 要取 pool->lock 与 dag->lock，
++     * 而这两把锁在 balance 路径里总是**关中断**获取的
++     * （balance_yat_casched -> rq_lock(关中断) -> ... -> pool->lock），
++     * 于是它们在 lockdep 眼里是 HARDIRQ-safe 锁。
++     * 若在 task_dead（finish_task_switch 调用，中断是开的）里直接取，
++     * lockdep 会报出真实的 ABBA：
++     *
++     *   CPU0: lock(pool->lock)                      // 中断开
++     *   CPU1: lock(rq->lock, 中断关) -> lock(pool->lock)
++     *   <CPU0 中断> lock(rq->lock)                  // 环闭合
++     *
++     * 实测该告警在 QEMU 串口里可复现（见 docs/validation/，镜像 #18）。
++     * 用 local_irq_save() 把整段销毁放进关中断区间后，pool->lock/dag->lock
++     * 的获取上下文与其它路径一致，环被打断；临界区内只有 list 操作和
++     * kfree，不会睡眠，时延是常数级。
++     */
++    local_irq_save(flags);
 +    yat_destroy_job(job);
++    local_irq_restore(flags);
 +}
 +
 +/*
@@ -2764,20 +2859,29 @@ Upstream: linux v6.8 (torvalds)
 +    return total_sum;
 +}
 +
-+/* 简化的CRP比率计算 */
++/*
++ * CRP 比率：把 recency（自上次运行以来该核上跑过的执行时间总和）
++ * 归一化成 0..1000 的千分比。0 = 刚跑过（热），1000 = 凉透（等于没有收益）。
++ *
++ * 两个计数器就是为了回答"这个模型还活着吗"：
++ *   crp_used 每次计算都加一；
++ *   crp_sat  只在撞上窗口上限时加一。饱和意味着 benefit 恒为 0，
++ *            MSF 退化成纯 WCET 排序——而这不会产生任何报错，
++ *            所以必须靠计数器显式暴露出来。
++ */
 +u64 yat_get_crp_ratio(u64 recency)
 +{
-+    /* 简化实现：recency越大，CRP比率越大 */
-+    /* 返回千分比形式的比率，避免浮点运算 */
++    YAT_STAT_INC(crp_used);
++
 +    if (recency == 0)
 +        return 0;
-+    
-+    /* 假设最大recency为某个阈值，进行归一化 */
-+    u64 max_recency = 1000000; /* 1秒，根据实际情况调整 */
-+    if (recency >= max_recency)
-+        return 1000; /* 100% */
-+    
-+    return (recency * 1000) / max_recency;
++
++    if (recency >= YAT_CRP_MAX_RECENCY_NS) {
++        YAT_STAT_INC(crp_sat);
++        return 1000;
++    }
++
++    return (recency * 1000) / YAT_CRP_MAX_RECENCY_NS;
 +}
 +
 +/*
@@ -2962,6 +3066,8 @@ Upstream: linux v6.8 (torvalds)
 +    if (!pool)
 +        return;
 +
++    YAT_STAT_INC(pool_scans);
++
 +    spin_lock(&global_dag_lock);
 +    list_for_each_entry(dag, &global_dag_list, dag_list) {
 +        spin_lock(&dag->lock);
@@ -3009,6 +3115,23 @@ Upstream: linux v6.8 (torvalds)
 + * 要处理的作业；找不到核心时用 enqueue 放回（enqueue 会按优先级重新
 + * 插位并恢复 state=READY，语义等价于"未取出"）。
 + */
++/*
++ * 是否需要重新扫描就绪池？
++ *
++ * 返回 true 时顺手把"已扫描代际"推进到当前快照：若扫描期间又有就绪
++ * 事件发生，代际会再次不同，下一轮 balance 自然补扫，不会漏作业。
++ */
++static bool yat_ready_scan_needed(void)
++{
++	int gen = atomic_read(&yat_ready_gen);
++
++	if (gen == atomic_read(&yat_scanned_gen))
++		return false;
++
++	atomic_set(&yat_scanned_gen, gen);
++	return true;
++}
++
 +void yat_schedule_ajlr(struct yat_casched_rq *rq)
 +{
 +    struct yat_job *job;
@@ -3023,8 +3146,18 @@ Upstream: linux v6.8 (torvalds)
 +    if (!pool)
 +        return;
 +
-+    /* 1. 更新就绪池 */
-+    yat_update_ready_pool(rq);
++    /*
++     * 1. 更新就绪池 —— 仅当自上次扫描以来有作业变成就绪（Route A）。
++     *    没有新就绪作业且池子为空时，本轮不可能产出任何分配，
++     *    直接返回，连 DAG 链表都不遍历。
++     */
++    if (yat_ready_scan_needed()) {
++        yat_update_ready_pool(rq);
++    } else {
++        YAT_STAT_INC(pool_scan_skips);
++        if (READ_ONCE(pool->nr_jobs) == 0)
++            return;
++    }
 +
 +    /*
 +     * 2. 循环分配。

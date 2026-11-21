@@ -91,7 +91,7 @@ pick_null_desync     0
 
 > 早于 #20 的镜像（如 #14、#19）读数不同：`select_calls` 约 459、`select_decided` 与
 > `jobs_placed` 为 254、`place_hit 925 / pending 14`、`balance_runs 757`。
-> 这些差异来自就绪代际门禁（补丁 `0008`），不是负载变了。
+> 这些差异来自就绪代际门禁（就绪代际门禁），不是负载变了。
 
 ---
 

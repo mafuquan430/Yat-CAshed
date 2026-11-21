@@ -771,7 +771,7 @@ guest 内 \code{nr\_cpu\_ids=1} & 启动参数里带了 \code{acpi=off} &
 \code{select\_calls=0} 而 \code{enq\_calls} 正常 &
 任务被绑定到单核，包装层直接返回 & 改用 \code{--affinity none} \\
 串口出现 \code{possible irq lock inversion} &
-池锁与运行队列锁的获取顺序不一致 & 升级到含修复的版本（补丁 0007） \\
+池锁与运行队列锁的获取顺序不一致 & 升级到含修复的版本（修复并入主补丁 0001） \\
 日志里找不到 \code{YATCSV} 行且两次运行结果相同 &
 两个测量实例并行，共用 \code{results/} 目录 & 等待前一个实例结束；脚本已加文件锁 \\
 杀进程后残留 QEMU 占满 CPU & 中断导致子进程未回收 & \code{pkill -f qemu-system} 后重跑 \\

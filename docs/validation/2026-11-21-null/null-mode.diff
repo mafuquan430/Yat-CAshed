@@ -1,0 +1,74 @@
+diff --git a/linux-6.8-main/kernel/sched/yat_casched.c b/linux-6.8-main/kernel/sched/yat_casched.c
+index fababed70..75a5a6761 100644
+--- a/linux-6.8-main/kernel/sched/yat_casched.c
++++ b/linux-6.8-main/kernel/sched/yat_casched.c
+@@ -265,6 +265,23 @@ struct yat_casched_stats {
+ 
+ static DEFINE_PER_CPU(struct yat_casched_stats, yat_stats);
+ 
++/* ------------------------------------------------------------------
++ * 标定实验开关（默认关闭，不改变正常行为）
++ *
++ * 作用：内核命令行给 yatnull=1 时，把热路径上"我们自己的"工作全部摘掉——
++ * 不算 CRP、不写历史表、不扫就绪池、不做均衡；入队出队与选核仍走正确路径。
++ * 目的：量出"框架与运行队列的固定税"和"我们自己的记账成本"各占多少。
++ * ------------------------------------------------------------------ */
++static bool yat_null_mode __read_mostly;
++
++static int __init yat_null_setup(char *str)
++{
++	yat_null_mode = true;
++	pr_info("yat_casched: null mode ON (no CRP / no history / no balance scan)\n");
++	return 1;
++}
++__setup("yatnull=", yat_null_setup);
++
+ /* debugfs 根节点：/sys/kernel/debug/yat_casched（未编译 DEBUG_FS 时为 NULL） */
+ static struct dentry *yat_debugfs_root;
+ 
+@@ -1718,6 +1735,10 @@ int select_task_rq_yat_casched(struct task_struct *p, int task_cpu, int flags)
+ 
+     YAT_STAT_INC(select_calls);
+ 
++    if (unlikely(yat_null_mode))
++        return cpumask_test_cpu(task_cpu, p->cpus_ptr) ? task_cpu
++                                                       : cpumask_first(p->cpus_ptr);
++
+     if (!(flags & WF_TTWU)) {
+         YAT_STAT_INC(select_not_ttwu);
+         return task_cpu;
+@@ -2065,6 +2086,11 @@ void task_tick_yat_casched(struct rq *rq, struct task_struct *p, int queued)
+ {
+     struct sched_yat_casched_entity *yat_se = &p->yat_casched;
+     u64 runtime, time_slice;
++
++    if (unlikely(yat_null_mode)) {
++        update_curr_yat_casched(rq);
++        return;
++    }
+     
+     update_curr_yat_casched(rq);
+     
+@@ -2116,6 +2142,9 @@ static DEFINE_SPINLOCK(yat_balance_lock);
+ 
+ int balance_yat_casched(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
+ {
++    if (unlikely(yat_null_mode))
++        return 0;
++
+     struct yat_ready_job_pool *pool = rq->yat_casched.ready_pool;
+ 
+     /*
+diff --git a/linux-6.8-main/yat_test_scripts/compare_cfs_vs_yat.sh b/linux-6.8-main/yat_test_scripts/compare_cfs_vs_yat.sh
+index 4f6950693..843336bd6 100755
+--- a/linux-6.8-main/yat_test_scripts/compare_cfs_vs_yat.sh
++++ b/linux-6.8-main/yat_test_scripts/compare_cfs_vs_yat.sh
+@@ -311,7 +311,7 @@ run_one() {
+         -nographic \
+         -no-reboot \
+         -accel tcg \
+-        -append "console=ttyS0,115200 panic=1 nokaslr yatbench=${policy} benchmark=${TASKS},${ITERS},${CPU},${AFFINITY},${SLEEP_US}" \
++        -append "console=ttyS0,115200 panic=1 nokaslr yatbench=${policy} benchmark=${TASKS},${ITERS},${CPU},${AFFINITY},${SLEEP_US} yatnull=1" \
+         > "$log" 2>&1
+ 
+     local rc=$?

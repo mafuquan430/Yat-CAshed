@@ -21,7 +21,7 @@
 \toprule
 载体 & 规模 & 入口 \\
 \midrule
-\texttt{kernel/sched/yat\_casched.c} & 2950 行 C & \texttt{make kernel-build} \\
+\texttt{kernel/sched/yat\_casched.c} & 3018 行 C & \texttt{make kernel-build} \\
 \texttt{include/linux/sched/yat\_casched.h} & 266 行，29 个声明 & \texttt{make symbol-check} \\
 \texttt{include/trace/events/yat\_casched.h} & 228 行，3 个 tracepoint & \texttt{debugfs} 寄存器组 \\
 \texttt{yat\_test\_scripts/} & 3 配置 $\times$ 5 次 $\times$ 2 个镜像 & \texttt{compare\_cfs\_vs\_yat.sh} \\
@@ -37,7 +37,7 @@
 本文是"把系统做完、测完、核对完"之后的工程记录，四件事按依赖顺序排列：
 
 \begin{enumerate}
-    \item \textbf{实现}：在 Linux 6.8 上新增内置调度类 \texttt{SCHED\_YAT\_CASCHED}（策略号 8），完成选核、DAG/作业生命周期、每核历史表、加速表、33 项计数器与 \texttt{debugfs} 观测接口，并固化成 6 个可独立应用的补丁。
+    \item \textbf{实现}：在 Linux 6.8 上新增内置调度类 \texttt{SCHED\_YAT\_CASCHED}（策略号 8），完成选核、DAG/作业生命周期、每核历史表、加速表、35 项计数器与 \texttt{debugfs} 观测接口，并固化成 6 个可独立应用的补丁。
     \item \textbf{修复}：定位并修掉一处被 \texttt{lockdep} 实证的锁反序（\texttt{task\_dead} 在开中断上下文销毁作业，与 balance 路径构成 ABBA）；重建镜像复跑两组对照，同类告警计数归零，修复并入发布补丁 \texttt{0001}。
     \item \textbf{测量与归因}：同一份负载、同一个二进制，用三组配置各重复 5 次。主口径给出总代价（1.81 倍），单核 pin 与无唤醒两组把总代价拆成"选核"与"接入"两笔，得到"选核只占约 5\%"这个可执行的结论（\S\ref{sec:test}）。
     \item \textbf{闭环优化}：由计数器指出的空转（\texttt{balance\_runs}=757 而唤醒仅 512 次）驱动出"就绪代际门禁"，把 98.6\% 的 balance 调用变成不取锁的快速路径，并让主口径从 2.00 降到 1.81（\S\ref{sec:test}）。

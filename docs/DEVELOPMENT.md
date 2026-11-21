@@ -264,7 +264,7 @@ diff -u docs/validation/2026-11-13/kernel/repeat/SUMMARY.txt \
 | 优势 | 证据 | 一条命令 |
 |---|---|---|
 | 实现完整、可重建 | 6 个补丁按序应用后与工作树逐字节一致 | `make patch-check`；上游树存在时 `scripts/kernel-patch.sh --selftest --upstream <linux-6.8>` |
-| 可观测、且断言可证伪 | 33 个 debugfs 计数器 + 3 个 tracepoint；头文件 29 个声明全部有定义 | `make symbol-check` |
+| 可观测、且断言可证伪 | 35 个 debugfs 计数器 + 3 个 tracepoint；头文件 29 个声明全部有定义 | `make symbol-check` |
 | 实验设计能分离因果 | 三配置消融：1.81 / 1.72 / 0.84（`shared` 下 `select_calls=0`） | `bash scripts/run_kernel_repeats.sh --repeats 5 --out /tmp/r` |
 | 结论可复算 | 66 项数字由归档 CSV 重算，抄错即失败 | `make numbers-check` |
 | 文档不漂移 | 结构、链接、数字、项目名、符号、补丁六道门禁 | `make verify-all` |

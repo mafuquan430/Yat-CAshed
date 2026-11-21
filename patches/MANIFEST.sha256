@@ -1,4 +1,4 @@
-87e4cfb1566912e57a8c34ba5c4415d1463873e1cbbc1b9076324560f8318952  0001-sched-yat-casched-core.patch
+8986a537e0e01299a630b64319c7dd3a10ba887a2040f65cec15a7d4f420a6dc  0001-sched-yat-casched-core.patch
 a418b88ff6ec2bea1618eeb600d780dc6682c66b48875fde5741f8ccf554ba86  0002-sched-yat-casched-integration.patch
 e92a6a704d4506ca292ea6bddb1ec374de6148a6dd5a9220b6f6f70b88ae20b7  0003-x86-realmode-tolerate-missing-trampoline.patch
 977ccf2e8e28c0089d5517f015a23bf4ebed924b1e16f88abd0b1f4fea79c077  0004-kernel-gitignore.patch

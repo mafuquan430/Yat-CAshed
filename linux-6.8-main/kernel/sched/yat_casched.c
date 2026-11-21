@@ -226,6 +226,8 @@ struct yat_casched_stats {
 	 */
 	u64 crp_used;		/* 调用 yat_get_crp_ratio() 的次数 */
 	u64 crp_sat;		/* 其中 recency 达到窗口上限、比率被钳到 1000 的次数 */
+	u64 crp_nohist;		/* 其中"该核没有本作业历史"的次数 */
+	u64 crp_split;		/* 本次决策里候选核的 crp 不全相同的次数 */
 
 	/*
 	 * enqueue 侧探针：用来回答「为什么 select_task_rq 没被调用」。
@@ -394,6 +396,8 @@ static int yat_stats_show(struct seq_file *m, void *v)
 	seq_printf(m, "select_decided    %llu\n", YAT_STAT_SUM(select_decided));
 	seq_printf(m, "crp_used          %llu\n", YAT_STAT_SUM(crp_used));
 	seq_printf(m, "crp_sat           %llu\n", YAT_STAT_SUM(crp_sat));
+	seq_printf(m, "crp_nohist        %llu\n", YAT_STAT_SUM(crp_nohist));
+	seq_printf(m, "crp_split         %llu\n", YAT_STAT_SUM(crp_split));
 	seq_printf(m, "enq_calls         %llu\n", YAT_STAT_SUM(enq_calls));
 	seq_printf(m, "enq_cpus_allowed  %llu\n", YAT_STAT_SUM(enq_cpus_allowed_sum));
 	seq_printf(m, "ttwu_state_bail   %llu\n", YAT_STAT_SUM(ttwu_state_bail));
@@ -2432,20 +2436,67 @@ u64 yat_sum_exec_time_multi(int *cpu_list, int cpu_count, u64 start_ts, u64 end_
  *            MSF 退化成纯 WCET 排序——而这不会产生任何报错，
  *            所以必须靠计数器显式暴露出来。
  */
+/*
+ * CRP 曲线的拐点（微秒 → 千分比）。
+ *
+ * 原实现是一条直线（0 到 1 ms 线性爬升），把"缓存刚凉"和"凉了一半"当成
+ * 同一种衰减。原理文档给出的是**单调递增的分段线性剖面**：L1 命中窗口在
+ * 几十微秒，L2 在数百微秒，L3 才到毫秒。这里用五个拐点近似三段曲线，
+ * 拐点的量级取自本轮实测的 recency 分布（98% < 1µs，长尾到几十毫秒），
+ * 曲线形状取自原理文档的性质（单调、分段线性、可用有限段逼近）。
+ */
+static const struct {
+	u64 ns;
+	u32 permille;
+} yat_crp_knee[] = {
+	{         0ULL,    0 },   /* 刚跑过：全热 */
+	{ 16000ULL, 100 },       /* 16 µs 内：多数 L1 行还在 */
+	{ 64000ULL, 300 },       /* 64 µs：L1 基本换掉，L2 仍可命中 */
+	{ 256000ULL, 650 },      /* 256 µs：L2 命中率显著下降 */
+	{ YAT_CRP_MAX_RECENCY_NS, 1000 }, /* 1 ms：视作全冷 */
+};
+
+#define YAT_CRP_KNEE_NR ARRAY_SIZE(yat_crp_knee)
+
+/*
+ * 没有历史（任务第一次运行，或历史被裁剪）不等于"刚跑过"。
+ *
+ * 原实现把两者都算成 recency = 0 → 比率 0 → benefit 最大，于是"没跑过的核"
+ * 反而比"跑过的核"更受欢迎，缓存感知完全失效。这里显式返回一个哨兵，
+ * 由 yat_get_crp_ratio() 判为全冷，并计入 crp_nohist。
+ */
+#define YAT_CRP_NOHIST_NS U64_MAX
+
 u64 yat_get_crp_ratio(u64 recency)
 {
-    YAT_STAT_INC(crp_used);
-    yat_recency_record(recency);
+    unsigned int i;
 
-    if (recency == 0)
-        return 0;
+    YAT_STAT_INC(crp_used);
+
+    if (recency == YAT_CRP_NOHIST_NS) {
+        YAT_STAT_INC(crp_nohist);
+        return 1000;
+    }
+
+    yat_recency_record(recency);
 
     if (recency >= YAT_CRP_MAX_RECENCY_NS) {
         YAT_STAT_INC(crp_sat);
         return 1000;
     }
 
-    return (recency * 1000) / YAT_CRP_MAX_RECENCY_NS;
+    /* 分段线性插值：找到 recency 落在哪一段，段内线性插值 */
+    for (i = 1; i < YAT_CRP_KNEE_NR; i++) {
+        u64 hi = yat_crp_knee[i].ns;
+        u64 lo = yat_crp_knee[i - 1].ns;
+        u32 chi = yat_crp_knee[i].permille;
+        u32 clo = yat_crp_knee[i - 1].permille;
+
+        if (recency <= hi)
+            return clo + div_u64((u64)(chi - clo) * (recency - lo), hi - lo);
+    }
+
+    return 1000;
 }
 
 /*
@@ -2508,6 +2559,14 @@ u64 yat_calculate_recency(int job_id, int cpu_id, u64 now)
     /* L3 层（全局共享缓存）：与 L2 相同，简化处理 */
     l3_recency = l2_recency;
 
+    /*
+     * 一个记录都没找到：说明这个作业在这台机器上还没有执行历史
+     * （新建作业，或历史表被裁剪）。这不是"刚跑过"，必须与 recency = 0
+     * 区分开，否则"没跑过的核"会被当成最热的核。
+     */
+    if (l1_last == 0 && l2_last == 0)
+        return YAT_CRP_NOHIST_NS;
+
     return l1_recency + l2_recency + l3_recency;
 }
 
@@ -2557,6 +2616,7 @@ static int yat_find_best_core_allowed(struct yat_job *job,
     u64 best_crp_ratio = 0;
     u64 current_benefit, current_impact;
     u64 recency, crp_ratio;
+    u64 crp_min = ULLONG_MAX, crp_max = 0;
     u64 now = ktime_get_ns();
     int cpu;
     
@@ -2570,6 +2630,12 @@ static int yat_find_best_core_allowed(struct yat_job *job,
         recency = yat_calculate_recency(job->job_id, cpu, now);
         crp_ratio = yat_get_crp_ratio(recency);
         current_benefit = ((1000 - crp_ratio) * job->wcet) / 1000;
+
+        /* 区分度：候选核之间的 crp 若全都相同，CRP 这次没有起区分作用 */
+        if (crp_ratio < crp_min)
+            crp_min = crp_ratio;
+        if (crp_ratio > crp_max)
+            crp_max = crp_ratio;
         
         if (current_benefit < max_benefit)
             continue;
@@ -2605,6 +2671,8 @@ static int yat_find_best_core_allowed(struct yat_job *job,
      * accel_inserts 的差值就是加速表分配失败的次数。
      */
     if (best_core != YAT_INVALID_CORE) {
+        if (crp_max > crp_min)
+            YAT_STAT_INC(crp_split);
         YAT_STAT_INC(jobs_placed);
         trace_yat_casched_place(job->job_id, best_core, max_benefit,
                                 best_crp_ratio, job->wcet);

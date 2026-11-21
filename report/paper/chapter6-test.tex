@@ -177,12 +177,49 @@ none + 无唤醒 & 0.84 & 0.81 & 1.17 & 无唤醒路径 \\
 
 这些数字\textbf{不作为}本文的证据：模拟器的执行时间与命中判定都由自建模型给出，不含抢占、迁移、TLB 与真实 LLC 竞争，口径稍一变动结论就翻转（同一批数据在三套口径下分别是 11.66\%、$-0.95\%$、$-3.52\%$，详见 \texttt{docs/validation/}）。它留下的可用资产是"设计期该验证什么"的清单，代码与全部实验结果仍在仓库中，供需要复现的人查阅。
 
+\subsection{真机阶段：树莓派 5 上的 TacleBench} \label{sec:pi}
+
+上面的实测都在 QEMU 里完成，回答的是"代价有多大"。真机回答另一个问题——"收益有没有"。
+项目在 2025 年 7 月用树莓派 5（ARM64，4 核，内核 \texttt{6.8.0-1031-raspi}）跑过一轮
+TacleBench 对比。
+
+负载为 12 类计算任务（binarysearch、bitcount、bitonic、bsort、complex\_updates、cosf、
+countnegative、cubic、deg2rad、fac、fft、filterbank），每类取数十个并发副本，共 10 轮；
+WCET 由每任务 100 次运行取最大值再加 10\% 裕度得到。
+
+\begin{table}[H]
+\centering
+\caption{树莓派 5 上 TacleBench 12 类任务并发对比（10 轮平均）}
+\label{tab:pi}
+\begin{tabular}{lrrr}
+\toprule
+量 & CFS & Yat-CAshed & 变化 \\
+\midrule
+平均轮次用时 (ms) & 1550.8 & 1413.1 & $-9.77\%$ \\
+每轮节省 (ms) & --- & 137.7 & --- \\
+等效加速比 & 1.000 & 1.108 & --- \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+为什么真机能赚而 QEMU 不能，原因在两处。其一是\textbf{并发度}：副本数远大于核数，任意时刻
+都有多个可运行任务，选核才有真正的选择空间；单程序顺序跑时只有一个可运行任务，"放哪个核"
+这个决策根本不发生。其二是\textbf{缓存层次}：树莓派 5 有真实 L1/L2/L3，把任务放回上次运行
+过的核能命中私有缓存；TCG 没有缓存模型，同一实现只剩开销，于是表现为成倍变慢。两个结论
+不矛盾——它们量的是不同条件下的不同东西。
+
+\textbf{证据等级}。本轮（2026 年 11 月）没有真机复测，板子已不在手上。$-9.77\%$ 取自竞赛
+阶段开发文档的汇总表；同期的 CFS 基准原始日志（54 个程序、逐程序 5 次）与测试脚本已归档在
+\texttt{docs/validation/pi-2025-07-30/}，但 Yat 侧的逐轮日志没有留存，因此这个数只能作为
+\textbf{汇总结论}引用，无法逐轮重算。要把它变成可复核的数据，需要在同型号机器上用同一脚本
+重跑一次——这是\autoref{sec:conclusion}路线 C 里最有价值的一步。
+
 \subsection{有效性与边界}
 
 \begin{itemize}
   \item \textbf{平台是 QEMU/TCG，不是裸金属}。TCG 无硬件虚拟化，墙钟与真实机器不可比；本文的结论只到"在 TCG 下成倍变慢"这个量级，迁移到裸机需要重测（路线 C）。
   \item \textbf{单负载形状}：8 任务、200\,$\mu$s 睡眠、64 段。结论对"频繁唤醒 + 可跨核"的负载成立，对纯计算或强亲和性负载不适用（后者回调根本不被调用）。
   \item \textbf{5 次重复只够给区间}。同一配置的三次运行可差 28\%，本文因此报中位数与全距，不报 $p$ 值，也不把 5\% 量级的差异当结论；确定性判断一律交给计数器。
-  \item \textbf{没有真实 LLC 竞争}。QEMU 的 4 vCPU 共享宿主机缓存，guest 内的缓存层级是模拟的；本文不声称测到了缓存收益，只测到调度开销。
+  \item \textbf{没有真实 LLC 竞争}。QEMU 的 4 vCPU 共享宿主机缓存，guest 内的缓存层级是模拟的；本文在 TCG 下不声称测到了缓存收益，只测到调度开销；真机阶段的收益见第\ref{sec:pi}节。
   \item \textbf{亲和性语义}：\texttt{shared} 配置下 \texttt{select\_task\_rq} 不被调用，这类数据只能谈时间片分配，不能谈 AJLR——这一点在脚本头注释与第\ref{sec:difficulties}节都写明了，避免以后误读。
 \end{itemize}

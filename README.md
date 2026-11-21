@@ -153,7 +153,9 @@ Yat-CAShed/
 bash scripts/run_kernel_repeats.sh --repeats 5
 ```
 
-> ⚠️ 所有实测都在 QEMU/TCG 上，墙钟与真实机器不可比，同配置三次可差 28%。
+> ⚠️ 本轮的实测都在 QEMU/TCG 上，墙钟与真实机器不可比，同配置三次可差 28%。
+> 真机证据来自竞赛阶段：树莓派 5 上 TacleBench 12 类任务并发、10 轮平均，轮次用时 1550.8 → 1413.1 ms（−9.77%），
+> 原始 CFS 基准日志与脚本归档在 [`docs/validation/pi-2025-07-30/`](docs/validation/pi-2025-07-30/README.md)，Yat 侧逐轮日志未留存。
 > 因此只报中位数与全距、不报 p 值，也不把 5% 量级的差异当结论。
 
 ### 3. 前期工作：调度模拟器（[`simulator/`](simulator)）
